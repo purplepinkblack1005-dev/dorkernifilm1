@@ -1,7 +1,7 @@
 import os
 
 
-TELEGRAM_BOT_TOKEN = "7906378548:AAG-Lfa8TQp3ov4_T3vvCRQNggERbM-FDzA"
+TELEGRAM_BOT_TOKEN = "8942335127:AAHSepVYiYRv2ymWj2ijLw2FST5Pxyk18bg"
 # Search settings
 MAX_RESULTS_PER_DORK = int(os.getenv("MAX_RESULTS_PER_DORK", "100"))
 WORKERS = int(os.getenv("WORKERS", "5"))
