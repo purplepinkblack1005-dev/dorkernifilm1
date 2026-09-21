@@ -3,14 +3,26 @@ import logging
 import os
 import random
 import time
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qs
 from typing import List, Dict, Optional, Set
+from zoneinfo import ZoneInfo
+
 from ddgs import DDGS
 
-from datetime import datetime
 import config
 
 logger = logging.getLogger(__name__)
+
+# -------------------------------
+# Timezone (Philippine Time by default)
+# -------------------------------
+TZ = ZoneInfo(os.getenv("TZ", "Asia/Manila"))
+
+
+def now_str() -> str:
+    """Return current time in configured timezone as HH:MM:SS."""
+    return datetime.now(TZ).strftime("%H:%M:%S")
 
 
 def format_duration(seconds: float) -> str:
@@ -191,7 +203,6 @@ class SearchManager:
             with open(filename, "r", encoding="utf-8") as f:
                 lines = [line.strip() for line in f if line.strip()]
             self.unique_sites = set(lines)
-            # Apply domain deduplication on loaded sites
             self.unique_sites = deduplicate_by_domain(self.unique_sites)
             logger.info(f"Loaded {len(self.unique_sites)} existing sites from {filename}")
         except FileNotFoundError:
@@ -290,7 +301,6 @@ class SearchManager:
             if proxy_url:
                 parsed_proxies.append(proxy_url)
 
-        # Deduplicate
         combined = self.proxies + parsed_proxies
         self.proxies = list(dict.fromkeys(combined))
         logger.info(f"Added {len(parsed_proxies)} proxies, total: {len(self.proxies)}")
@@ -371,7 +381,6 @@ class SearchManager:
         self._stop_requested = True
         logger.info("Stop requested, waiting for workers to finish...")
 
-        # Wait for the search task to complete
         if self.search_task and not self.search_task.done():
             try:
                 await asyncio.wait_for(self.search_task, timeout=10.0)
@@ -418,7 +427,6 @@ class SearchManager:
         try:
             await queue.join()
         except asyncio.CancelledError:
-            # Cancel all workers
             for task in worker_tasks:
                 task.cancel()
             raise
@@ -475,7 +483,6 @@ class SearchManager:
                             self.unique_sites.add(normalized)
                             new_sites += 1
 
-            # Apply domain deduplication after adding new sites
             async with self.lock:
                 before_count = len(self.unique_sites)
                 self.unique_sites = deduplicate_by_domain(self.unique_sites)
@@ -483,7 +490,6 @@ class SearchManager:
                 if before_count != after_count:
                     logger.info(f"Deduplication removed {before_count - after_count} duplicate domains")
 
-            # Save after every dork
             await self.write_sites_file()
 
         except asyncio.CancelledError:
