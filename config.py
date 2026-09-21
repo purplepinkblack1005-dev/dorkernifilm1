@@ -6,7 +6,7 @@ TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Manila"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Search settings
 MAX_RESULTS_PER_DORK = int(os.getenv("MAX_RESULTS_PER_DORK", "100"))
-WORKERS = int(os.getenv("WORKERS", "20"))
+WORKERS = int(os.getenv("WORKERS", "10"))
 PROGRESS_UPDATE_INTERVAL = int(os.getenv("PROGRESS_UPDATE_INTERVAL", "25"))
 OWNER_ID = int(os.getenv("OWNER_ID", "5703245194"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "100"))
