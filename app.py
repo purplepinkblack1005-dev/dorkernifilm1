@@ -11,7 +11,7 @@ from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 import config
-from searcher import SearchManager
+from searcher import SearchManager, now_str
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,9 @@ manager = SearchManager()
 progress_message_id: Optional[int] = None
 progress_chat_id: Optional[int] = None
 progress_task: Optional[asyncio.Task] = None
+
+# Last-rendered progress text — used to avoid Telegram rate limits
+last_progress_text: Optional[str] = None
 
 
 # -------------------------------
@@ -66,7 +69,7 @@ def start_health_server():
 # -------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the search."""
-    global progress_message_id, progress_chat_id, progress_task
+    global progress_message_id, progress_chat_id, progress_task, last_progress_text
 
     if manager.is_running():
         status = await manager.get_status()
@@ -79,7 +82,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Start search (if no dorks loaded, it will try dorks.txt)
     started = await manager.start_search()
     if not started:
         await update.message.reply_text(
@@ -88,9 +90,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Send initial progress message
-    msg = await update.message.reply_text(await _format_progress_message())
+    text = await _format_progress_message()
+    msg = await update.message.reply_text(text)
     progress_chat_id = update.effective_chat.id
     progress_message_id = msg.message_id
+    last_progress_text = text
 
     # Pass the actual application instance to the updater
     app = context.application
@@ -202,7 +206,6 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📄 No sites collected yet.")
         return
 
-    # Write current sites.txt and send
     await manager.write_sites_file()
     with open(config.SITES_FILE, "rb") as f:
         await update.message.reply_document(
@@ -232,7 +235,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Failed queries: {status['failed']}\n"
         f"Workers: {status['workers']}\n"
         f"Proxy: {'ON' if status['proxy_enabled'] else 'OFF'}\n"
-        f"Proxies loaded: {status.get('proxy_count', 0)}"
+        f"Proxies loaded: {status.get('proxy_count', 0)}\n"
+        f"🕐 Time: {now_str()} PHT"
     )
 
 
@@ -303,12 +307,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
         return
 
-    # Check if it's a proxy file
     if "proxy" in filename:
         count = manager.add_proxies(lines)
         await update.message.reply_text(f"✅ Added proxies. Total: {count}")
     else:
-        # Treat as dorks
         count = manager.add_dorks(lines)
         await update.message.reply_text(f"✅ Added dorks. Total: {count}")
 
@@ -335,24 +337,29 @@ async def _format_progress_message() -> str:
         f"Failed queries: {status['failed']}\n\n"
         f"Workers: {status['workers']}\n"
         f"Proxy: {proxy_status} ({proxy_count} loaded)\n\n"
-        f"Last update: {time.strftime('%H:%M:%S', time.localtime(status['last_update']))}"
+        f"🕐 Last update: {now_str()} PHT"
     )
 
 
 async def _progress_updater(app: Application):
     """Periodically edit the progress message while search is running."""
-    global progress_message_id, progress_chat_id, progress_task
+    global progress_message_id, progress_chat_id, progress_task, last_progress_text
     bot = app.bot
     try:
         while manager.is_running():
             await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
             if progress_message_id and progress_chat_id:
+                text = await _format_progress_message()
+                # Only edit if content actually changed (avoids Telegram rate limits)
+                if text == last_progress_text:
+                    continue
                 try:
                     await bot.edit_message_text(
                         chat_id=progress_chat_id,
                         message_id=progress_message_id,
-                        text=await _format_progress_message()
+                        text=text
                     )
+                    last_progress_text = text
                 except Exception as e:
                     logger.error(f"Failed to edit progress message: {e}")
 
@@ -381,7 +388,8 @@ async def _progress_updater(app: Application):
                         caption=(
                             f"✅ DONE!\n"
                             f"⏱️ Runtime: {runtime_str}\n"
-                            f"Unique sites: {len(sites)}"
+                            f"Unique sites: {len(sites)}\n"
+                            f"🕐 Finished at: {now_str()} PHT"
                         )
                     )
             else:
@@ -393,12 +401,18 @@ async def _progress_updater(app: Application):
         progress_task = None
         progress_message_id = None
         progress_chat_id = None
+        last_progress_text = None
 
 
 # -------------------------------
 # Error handler
 # -------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = str(context.error)
+    # Silence the "Conflict: terminated by other getUpdates" spam during redeploys
+    if "Conflict" in err and "getUpdates" in err:
+        logger.warning("Telegram conflict (another instance polling) — ignoring")
+        return
     logger.error(f"Update caused error: {context.error}")
 
 
@@ -407,8 +421,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # -------------------------------
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable not set!")
+        logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
         return
+
+    if not config.OWNER_ID:
+        logger.error("❌ OWNER_ID environment variable not set or invalid!")
+        return
+
+    logger.info(f"✅ Config loaded. Owner ID: {config.OWNER_ID}")
+    logger.info(f"🕐 Timezone: {os.getenv('TZ', 'Asia/Manila')}")
 
     # Start HTTP health server for Railway/UptimeRobot
     start_health_server()
