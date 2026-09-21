@@ -15,23 +15,18 @@ from searcher import SearchManager, now_str
 
 logger = logging.getLogger(__name__)
 
-# Global search manager
 manager = SearchManager()
 
-# Global progress message info (single active search)
 progress_message_id: Optional[int] = None
 progress_chat_id: Optional[int] = None
 progress_task: Optional[asyncio.Task] = None
-
-# Last-rendered progress text — used to avoid Telegram rate limits
 last_progress_text: Optional[str] = None
 
+# Track the most recent /addproxy prompt message id, so replying to it = proxy upload
+pending_proxy_prompt_id: Optional[int] = None
 
-# -------------------------------
-# Owner-only decorator
-# -------------------------------
+
 def owner_only(func):
-    """Decorator to restrict command to owner only."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -42,9 +37,6 @@ def owner_only(func):
     return wrapper
 
 
-# -------------------------------
-# Minimal HTTP health-check server for Railway/UptimeRobot
-# -------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -53,22 +45,20 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # Suppress default logging
+        pass
 
 
 def start_health_server():
     port = int(os.getenv("PORT", "8080"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"Health server listening on port {port}")
 
 
 # -------------------------------
-# Telegram command handlers
+# /start
 # -------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the search."""
     global progress_message_id, progress_chat_id, progress_task, last_progress_text
 
     if manager.is_running():
@@ -82,37 +72,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if getattr(config, "DORKS_URL", ""):
+        await update.message.reply_text("📥 Loading dorks...")
+
     started = await manager.start_search()
     if not started:
         await update.message.reply_text(
-            "❌ No dorks loaded. Use /adddork or upload a dorks.txt file first."
+            "❌ No dorks loaded. Use `/adddork <dork>` or upload a .txt file.",
+            parse_mode="Markdown"
         )
         return
 
-    # Send initial progress message
     text = await _format_progress_message()
     msg = await update.message.reply_text(text)
     progress_chat_id = update.effective_chat.id
     progress_message_id = msg.message_id
     last_progress_text = text
-
-    # Pass the actual application instance to the updater
-    app = context.application
-    progress_task = asyncio.create_task(_progress_updater(app))
+    progress_task = asyncio.create_task(_progress_updater(context.application))
 
 
+# -------------------------------
+# /stop
+# -------------------------------
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop the currently running search."""
-    global progress_task
-
     if not manager.is_running():
         await update.message.reply_text("ℹ️ No search is currently running.")
         return
-
     await update.message.reply_text("🛑 Stopping search...")
-
     stopped = await manager.stop_search()
-
     if stopped:
         await update.message.reply_text(
             f"✅ Search stopped.\n"
@@ -124,105 +111,167 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Failed to stop search.")
 
 
+# -------------------------------
+# /help
+# -------------------------------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all available commands."""
     await update.message.reply_text(
         "📋 **Available Commands**\n\n"
         "**Search Control:**\n"
-        "/start – Start a new search using loaded dorks\n"
-        "/stop – Stop the currently running search\n"
-        "/status – Show current search status\n\n"
+        "/start – Start a new search\n"
+        "/stop – Stop the running search\n"
+        "/status – Show search status\n\n"
         "**Dork Management:**\n"
-        "/adddork `<dork>` – Add a single dork\n"
-        "/listdorks – List all loaded dorks\n"
-        "/cleardorks – Clear all loaded dorks\n"
-        "📎 Upload dorks.txt – Load dorks from file\n\n"
+        "/adddork `<dork>` – Add one literal dork\n"
+        "/adddork `<url>` – Fetch & merge dorks from a raw URL\n"
+        "/listdorks – List loaded dorks\n"
+        "/cleardorks – Clear all dorks\n"
+        "📎 Upload any .txt → adds as dorks\n\n"
         "**Proxy Management (owner only):**\n"
-        "/addproxy `<host:port:user:pass>` – Add a proxy\n"
-        "/listproxies – List loaded proxies\n"
-        "/clearproxies – Clear all loaded proxies\n"
-        "📎 Upload proxy.txt – Load proxies from file\n\n"
+        "/addproxy `<host:port:user:pass>` – Add one proxy\n"
+        "/addproxy – Then reply with any .txt file → adds as proxies\n"
+        "/listproxies – List proxies\n"
+        "/clearproxies – Clear proxies\n\n"
         "**Export (owner only):**\n"
-        "/export – Download current sites.txt\n\n"
+        "/export – Download sites.txt\n\n"
         "**Info:**\n"
-        "/help – Show this help message",
+        "/help – This message",
         parse_mode="Markdown"
     )
 
 
+# -------------------------------
+# /adddork — literal dork OR URL
+# -------------------------------
 @owner_only
 async def adddork_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a single dork to the list."""
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Usage: `/adddork <dork>`\n"
-            "Example: `/adddork site:example.com inurl:admin`",
+            "⚠️ Usage:\n"
+            "• `/adddork site:example.com inurl:admin` — add one dork\n"
+            "• `/adddork https://example.com/dorks.txt` — fetch & merge from URL",
             parse_mode="Markdown"
         )
         return
 
-    dork = " ".join(context.args).strip()
-    if not dork:
-        await update.message.reply_text("⚠️ Please provide a valid dork.")
+    arg = " ".join(context.args).strip()
+    if not arg:
+        await update.message.reply_text("⚠️ Please provide a dork or URL.")
         return
 
-    count = manager.add_dorks([dork])
+    if arg.startswith("http://") or arg.startswith("https://"):
+        msg = await update.message.reply_text(
+            f"📥 Fetching dorks from:\n`{arg}`\n\nThis may take up to 60s (cold start)...",
+            parse_mode="Markdown"
+        )
+        added = await asyncio.to_thread(manager.load_dorks_from_remote, arg)
+        if added == 0:
+            await msg.edit_text(
+                "❌ Failed to fetch dorks from that URL.\n"
+                "Check the URL in your browser — it must return raw dork lines."
+            )
+            return
+        await msg.edit_text(
+            f"✅ Fetched & merged **{added}** new dorks.\n"
+            f"Total dorks: **{len(manager.dorks)}**",
+            parse_mode="Markdown"
+        )
+        return
+
+    count = manager.add_dorks([arg])
     await update.message.reply_text(
-        f"✅ Added dork: `{dork}`\n"
+        f"✅ Added dork: `{arg}`\n"
         f"Total dorks: {count}",
         parse_mode="Markdown"
     )
 
 
+# -------------------------------
+# /addproxy — single proxy OR prompts for reply with .txt
+# -------------------------------
 @owner_only
 async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a single proxy to the list."""
+    global pending_proxy_prompt_id
+
+    # No arguments → prompt user to reply with a .txt file
     if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/addproxy <host:port:username:password>`\n"
-            "Or: `/addproxy <host:port>`\n"
-            "Example: `/addproxy 192.168.1.1:8080:user:pass`",
+        msg = await update.message.reply_text(
+            "📎 **Reply to this message** with any `.txt` file containing proxies.\n\n"
+            "Accepted formats per line:\n"
+            "• `host:port`\n"
+            "• `host:port:username:password`\n\n"
+            "Lines starting with `#` are ignored.",
             parse_mode="Markdown"
         )
+        pending_proxy_prompt_id = msg.message_id
         return
 
+    # Has arguments → single proxy
     proxy_line = " ".join(context.args).strip()
     if not proxy_line:
         await update.message.reply_text("⚠️ Please provide a valid proxy.")
         return
 
     count = manager.add_proxies([proxy_line])
-    await update.message.reply_text(
-        f"✅ Added proxy.\n"
-        f"Total proxies: {count}"
-    )
+    await update.message.reply_text(f"✅ Added proxy.\nTotal proxies: {count}")
+
+
+# -------------------------------
+# /listproxies, /clearproxies
+# -------------------------------
+@owner_only
+async def listproxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not manager.proxies:
+        await update.message.reply_text("⚠️ No proxies loaded.")
+        return
+    proxies = manager.proxies[:10]
+    msg = "📄 Loaded proxies (showing first 10):\n" + "\n".join(f"• `{p}`" for p in proxies)
+    if len(manager.proxies) > 10:
+        msg += f"\n... and {len(manager.proxies)-10} more"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 @owner_only
-async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Export current sites (owner only)."""
-    sites = await manager.export_sites()
-    if not sites:
-        await update.message.reply_text("📄 No sites collected yet.")
+async def clearproxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not manager.proxies:
+        await update.message.reply_text("⚠️ No proxies to clear.")
         return
-
-    await manager.write_sites_file()
-    with open(config.SITES_FILE, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename="sites.txt",
-            caption=(
-                f"📄 Current results\n"
-                f"⏱️ Runtime: {manager.get_runtime_str()}\n"
-                f"Unique sites: {len(sites)}"
-            )
-        )
+    count = len(manager.proxies)
+    manager.clear_proxies()
+    await update.message.reply_text(f"✅ Cleared {count} proxies.")
 
 
+# -------------------------------
+# /listdorks, /cleardorks
+# -------------------------------
+async def listdorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not manager.dorks:
+        await update.message.reply_text("⚠️ No dorks loaded.")
+        return
+    dorks = manager.dorks[:30]
+    msg = "📄 Loaded dorks:\n" + "\n".join(f"• `{d}`" for d in dorks)
+    if len(manager.dorks) > 30:
+        msg += f"\n... and {len(manager.dorks)-30} more"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+@owner_only
+async def cleardorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not manager.dorks:
+        await update.message.reply_text("⚠️ No dorks to clear.")
+        return
+    count = len(manager.dorks)
+    manager.clear_dorks()
+    await update.message.reply_text(f"✅ Cleared {count} dorks.")
+
+
+# -------------------------------
+# /status, /export
+# -------------------------------
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await manager.get_status()
     state = "RUNNING" if status["running"] else "IDLE"
-    speed = status.get('speed', 0.0)
+    speed = status.get("speed", 0.0)
     await update.message.reply_text(
         f"🔎 DDGS Search Status\n"
         f"State: {state}\n"
@@ -240,90 +289,86 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def listdorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not manager.dorks:
-        await update.message.reply_text("⚠️ No dorks loaded.")
-        return
-    dorks = manager.dorks[:30]
-    msg = "📄 Loaded dorks:\n" + "\n".join(f"• `{d}`" for d in dorks)
-    if len(manager.dorks) > 30:
-        msg += f"\n... and {len(manager.dorks)-30} more"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
 @owner_only
-async def listproxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List loaded proxies (owner only)."""
-    if not manager.proxies:
-        await update.message.reply_text("⚠️ No proxies loaded.")
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sites = await manager.export_sites()
+    if not sites:
+        await update.message.reply_text("📄 No sites collected yet.")
         return
-    proxies = manager.proxies[:10]
-    msg = "📄 Loaded proxies (showing first 10):\n" + "\n".join(f"• `{p}`" for p in proxies)
-    if len(manager.proxies) > 10:
-        msg += f"\n... and {len(manager.proxies)-10} more"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await manager.write_sites_file()
+    with open(config.SITES_FILE, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename="sites.txt",
+            caption=(
+                f"📄 Current results\n"
+                f"⏱️ Runtime: {manager.get_runtime_str()}\n"
+                f"Unique sites: {len(sites)}"
+            )
+        )
 
 
-@owner_only
-async def cleardorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear all loaded dorks."""
-    if not manager.dorks:
-        await update.message.reply_text("⚠️ No dorks to clear.")
-        return
-
-    count = len(manager.dorks)
-    manager.clear_dorks()
-    await update.message.reply_text(f"✅ Cleared {count} dorks.")
-
-
-@owner_only
-async def clearproxies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear all loaded proxies."""
-    if not manager.proxies:
-        await update.message.reply_text("⚠️ No proxies to clear.")
-        return
-
-    count = len(manager.proxies)
-    manager.clear_proxies()
-    await update.message.reply_text(f"✅ Cleared {count} proxies.")
-
-
+# -------------------------------
+# File upload handler — smart routing
+# -------------------------------
 @owner_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded .txt file as either dorks or proxies (owner only)."""
+    """
+    Any .txt upload:
+      - If it's a REPLY to a /addproxy prompt → add as PROXIES
+      - Otherwise → add as DORKS
+    """
+    global pending_proxy_prompt_id
+
     doc: Document = update.message.document
-    filename = doc.file_name.lower()
+    filename = (doc.file_name or "file.txt").lower()
 
     if not filename.endswith(".txt"):
         await update.message.reply_text("⚠️ Please upload a .txt file.")
         return
 
+    # Is this a reply to the /addproxy prompt?
+    is_proxy_reply = False
+    reply_to = update.message.reply_to_message
+    if reply_to and pending_proxy_prompt_id and reply_to.message_id == pending_proxy_prompt_id:
+        is_proxy_reply = True
+
+    # Download the file
     file = await doc.get_file()
     data = await file.download_as_bytearray()
-    text = data.decode("utf-8")
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    text = data.decode("utf-8", errors="ignore")
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
 
     if not lines:
         await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
         return
 
-    if "proxy" in filename:
+    if is_proxy_reply:
         count = manager.add_proxies(lines)
-        await update.message.reply_text(f"✅ Added proxies. Total: {count}")
+        pending_proxy_prompt_id = None
+        await update.message.reply_text(
+            f"✅ Added proxies from `{doc.file_name}`.\n"
+            f"Total proxies: **{count}**",
+            parse_mode="Markdown"
+        )
     else:
         count = manager.add_dorks(lines)
-        await update.message.reply_text(f"✅ Added dorks. Total: {count}")
+        await update.message.reply_text(
+            f"✅ Added dorks from `{doc.file_name}`.\n"
+            f"Total dorks: **{count}**",
+            parse_mode="Markdown"
+        )
 
 
 # -------------------------------
-# Progress message updater
+# Progress message
 # -------------------------------
 async def _format_progress_message() -> str:
     status = await manager.get_status()
-    proxy_status = "ON" if status['proxy_enabled'] else "OFF"
-    proxy_count = status.get('proxy_count', 0)
-    state = "RUNNING" if status['running'] else "DONE"
-    speed = status.get('speed', 0.0)
+    proxy_status = "ON" if status["proxy_enabled"] else "OFF"
+    proxy_count = status.get("proxy_count", 0)
+    state = "RUNNING" if status["running"] else "DONE"
+    speed = status.get("speed", 0.0)
 
     return (
         f"🔎 DDGS Search\n\n"
@@ -342,7 +387,6 @@ async def _format_progress_message() -> str:
 
 
 async def _progress_updater(app: Application):
-    """Periodically edit the progress message while search is running."""
     global progress_message_id, progress_chat_id, progress_task, last_progress_text
     bot = app.bot
     try:
@@ -350,7 +394,6 @@ async def _progress_updater(app: Application):
             await asyncio.sleep(config.PROGRESS_UPDATE_INTERVAL)
             if progress_message_id and progress_chat_id:
                 text = await _format_progress_message()
-                # Only edit if content actually changed (avoids Telegram rate limits)
                 if text == last_progress_text:
                     continue
                 try:
@@ -363,7 +406,6 @@ async def _progress_updater(app: Application):
                 except Exception as e:
                     logger.error(f"Failed to edit progress message: {e}")
 
-        # Search finished – send final update and file
         if progress_message_id and progress_chat_id:
             final_text = await _format_progress_message()
             try:
@@ -375,7 +417,6 @@ async def _progress_updater(app: Application):
             except Exception as e:
                 logger.error(f"Failed to edit final message: {e}")
 
-            # Send final sites.txt (only to owner)
             sites = await manager.export_sites()
             runtime_str = manager.get_runtime_str()
             if sites:
@@ -409,7 +450,6 @@ async def _progress_updater(app: Application):
 # -------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = str(context.error)
-    # Silence the "Conflict: terminated by other getUpdates" spam during redeploys
     if "Conflict" in err and "getUpdates" in err:
         logger.warning("Telegram conflict (another instance polling) — ignoring")
         return
@@ -423,41 +463,34 @@ def main():
     if not config.TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
         return
-
     if not config.OWNER_ID:
         logger.error("❌ OWNER_ID environment variable not set or invalid!")
         return
 
     logger.info(f"✅ Config loaded. Owner ID: {config.OWNER_ID}")
     logger.info(f"🕐 Timezone: {os.getenv('TZ', 'Asia/Manila')}")
+    logger.info(f"📁 Dorks file: {config.DORKS_FILE}")
+    logger.info(f"📁 Proxy file: {config.PROXIES_FILE}")
 
-    # Start HTTP health server for Railway/UptimeRobot
     start_health_server()
 
     application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Search control
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
 
-    # Dork management
     application.add_handler(CommandHandler("adddork", adddork_cmd))
     application.add_handler(CommandHandler("listdorks", listdorks_cmd))
     application.add_handler(CommandHandler("cleardorks", cleardorks_cmd))
 
-    # Proxy management
     application.add_handler(CommandHandler("addproxy", addproxy_cmd))
     application.add_handler(CommandHandler("listproxies", listproxies_cmd))
     application.add_handler(CommandHandler("clearproxies", clearproxies_cmd))
 
-    # Export
     application.add_handler(CommandHandler("export", export_cmd))
-
-    # Help
     application.add_handler(CommandHandler("help", help_cmd))
 
-    # File upload handler
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_document))
 
     application.add_error_handler(error_handler)
