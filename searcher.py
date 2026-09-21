@@ -12,28 +12,33 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def format_duration(seconds: float) -> str:
+    """Format seconds into a human-readable duration string."""
+    if seconds < 0:
+        seconds = 0
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
+
+
 def normalize_url(url: str) -> str:
-    """
-    Normalize a URL to avoid trivial duplicates:
-    - lower scheme & host
-    - remove default port
-    - remove www.
-    - remove fragment
-    - keep query string for comparison
-    - remove trailing slash from path
-    """
+    """Normalize a URL to avoid trivial duplicates."""
     try:
         parsed = urlparse(url.strip())
         scheme = parsed.scheme.lower()
         netloc = parsed.netloc.lower()
 
-        # Remove default ports
         if (scheme == "http" and netloc.endswith(":80")) or (
             scheme == "https" and netloc.endswith(":443")
         ):
             netloc = netloc.rsplit(":", 1)[0]
 
-        # Remove leading "www."
         if netloc.startswith("www."):
             netloc = netloc[4:]
 
@@ -41,40 +46,25 @@ def normalize_url(url: str) -> str:
         if len(path) > 1 and path.endswith("/"):
             path = path[:-1]
 
-        # Keep query string for comparison
         query = parsed.query
-
-        # Drop fragment
         return urlunparse((scheme, netloc, path, "", query, ""))
     except Exception:
         return url.strip().lower()
 
 
 def get_domain_key(url: str) -> str:
-    """
-    Extract a domain key for deduplication.
-    Returns: scheme://netloc (domain only, without path or query string)
-    This ensures all URLs from the same domain are grouped together.
-    """
     try:
         parsed = urlparse(url)
         scheme = parsed.scheme.lower()
         netloc = parsed.netloc.lower()
-        
-        # Remove www. for consistent domain matching
         if netloc.startswith("www."):
             netloc = netloc[4:]
-            
         return f"{scheme}://{netloc}"
     except Exception:
         return url
 
 
 def get_param_count(url: str) -> int:
-    """
-    Count the number of parameters in the query string.
-    More parameters = longer/more complex URL.
-    """
     try:
         parsed = urlparse(url)
         if not parsed.query:
@@ -86,7 +76,6 @@ def get_param_count(url: str) -> int:
 
 
 def parse_proxy_line(line: str) -> Optional[str]:
-    """Parse proxy in format: host:port:username:password"""
     line = line.strip()
     if not line or line.startswith("#"):
         return None
@@ -104,12 +93,6 @@ def parse_proxy_line(line: str) -> Optional[str]:
 
 
 def deduplicate_by_domain(urls: Set[str]) -> Set[str]:
-    """
-    Deduplicate URLs by domain (scheme://netloc).
-    For each unique domain, keep the URL with the most parameters (longest query string).
-    If no query strings, keep the base URL.
-    If same parameter count, keep the longer URL.
-    """
     domain_map: Dict[str, str] = {}
 
     for url in urls:
@@ -117,18 +100,14 @@ def deduplicate_by_domain(urls: Set[str]) -> Set[str]:
         param_count = get_param_count(url)
 
         if domain_key not in domain_map:
-            # First time seeing this domain
             domain_map[domain_key] = url
         else:
-            # Compare parameter counts
             existing_url = domain_map[domain_key]
             existing_param_count = get_param_count(existing_url)
 
-            # Keep the URL with more parameters (longer query string)
             if param_count > existing_param_count:
                 domain_map[domain_key] = url
             elif param_count == existing_param_count:
-                # If same param count, keep the longer URL (more characters)
                 if len(url) > len(existing_url):
                     domain_map[domain_key] = url
 
@@ -149,14 +128,58 @@ class SearchManager:
 
         self.running: bool = False
         self.search_task: Optional[asyncio.Task] = None
+        self._stop_requested: bool = False
 
         self.lock = asyncio.Lock()
         self.file_lock = asyncio.Lock()
         self.last_update_time = time.time()
 
+        # Runtime tracking
+        self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
+        self.elapsed_time: float = 0.0
+
         # Load proxies and existing sites on startup
         self.load_proxies_from_file()
         self.load_sites_from_file()
+
+    # -------------------------------
+    # Runtime helpers
+    # -------------------------------
+    def get_runtime(self) -> float:
+        """Return total runtime in seconds (live if running, final if stopped)."""
+        if self.running and self.start_time:
+            return time.time() - self.start_time
+        return self.elapsed_time
+
+    def get_runtime_str(self) -> str:
+        """Return human-readable runtime string."""
+        return format_duration(self.get_runtime())
+
+    def get_eta(self) -> Optional[float]:
+        """Estimate remaining seconds based on current speed."""
+        runtime = self.get_runtime()
+        if not self.running or self.processed == 0 or runtime <= 0:
+            return None
+        rate = self.processed / runtime  # dorks per second
+        if rate <= 0:
+            return None
+        remaining = self.total - self.processed
+        return remaining / rate
+
+    def get_eta_str(self) -> str:
+        """Return human-readable ETA string."""
+        eta = self.get_eta()
+        if eta is None:
+            return "-"
+        return format_duration(eta)
+
+    def get_speed(self) -> float:
+        """Return dorks processed per second."""
+        runtime = self.get_runtime()
+        if runtime <= 0:
+            return 0.0
+        return self.processed / runtime
 
     # -------------------------------
     # Load existing sites from disk
@@ -175,7 +198,7 @@ class SearchManager:
             self.unique_sites = set()
 
     # -------------------------------
-    # Dork loading
+    # Dork loading & management
     # -------------------------------
     def load_dorks_from_file(self, filename: str = config.DORKS_FILE) -> int:
         """Read dorks from a text file, clean, deduplicate."""
@@ -195,8 +218,34 @@ class SearchManager:
         self.failed = 0
         return self.total
 
+    def add_dorks(self, new_dorks: List[str]) -> int:
+        """Add new dorks to existing list, return total count."""
+        combined = self.dorks + new_dorks
+        self.dorks = list(dict.fromkeys(combined))
+        self.total = len(self.dorks)
+        self.save_dorks_to_file()
+        return self.total
+
+    def clear_dorks(self) -> bool:
+        """Clear all dorks and save to file."""
+        self.dorks = []
+        self.total = 0
+        self.processed = 0
+        self.failed = 0
+        self.save_dorks_to_file()
+        return True
+
+    def save_dorks_to_file(self, filename: str = config.DORKS_FILE):
+        """Save current dorks to file."""
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(self.dorks))
+            logger.info(f"Saved {len(self.dorks)} dorks to {filename}")
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
+
     # -------------------------------
-    # Proxy loading
+    # Proxy loading & management
     # -------------------------------
     def load_proxies_from_file(self, filename: str = config.PROXIES_FILE) -> int:
         """Read proxies from file, parse them, and store formatted URLs."""
@@ -229,7 +278,47 @@ class SearchManager:
         self.proxies = parsed_proxies
         self.current_proxy_index = 0
         logger.info(f"Set {len(self.proxies)} proxies")
+        self.save_proxies_to_file()
         return len(self.proxies)
+
+    def add_proxies(self, proxy_lines: List[str]) -> int:
+        """Add proxies to existing list."""
+        parsed_proxies = []
+        for line in proxy_lines:
+            proxy_url = parse_proxy_line(line)
+            if proxy_url:
+                parsed_proxies.append(proxy_url)
+
+        # Deduplicate
+        combined = self.proxies + parsed_proxies
+        self.proxies = list(dict.fromkeys(combined))
+        logger.info(f"Added {len(parsed_proxies)} proxies, total: {len(self.proxies)}")
+        self.save_proxies_to_file()
+        return len(self.proxies)
+
+    def clear_proxies(self) -> bool:
+        """Clear all proxies and save to file."""
+        self.proxies = []
+        self.current_proxy_index = 0
+        self.save_proxies_to_file()
+        return True
+
+    def save_proxies_to_file(self, filename: str = config.PROXIES_FILE):
+        """Save current proxies to file in original format."""
+        try:
+            lines = []
+            for proxy_url in self.proxies:
+                parsed = urlparse(proxy_url)
+                if parsed.username and parsed.password:
+                    lines.append(f"{parsed.hostname}:{parsed.port}:{parsed.username}:{parsed.password}")
+                else:
+                    lines.append(f"{parsed.hostname}:{parsed.port}")
+
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            logger.info(f"Saved {len(lines)} proxies to {filename}")
+        except Exception as e:
+            logger.error(f"Failed to write {filename}: {e}")
 
     def get_next_proxy(self) -> Optional[str]:
         """Return the next proxy in rotation."""
@@ -257,14 +346,46 @@ class SearchManager:
             return False
 
         self.running = True
+        self._stop_requested = False
         self.processed = 0
         self.failed = 0
         self.last_update_time = time.time()
         self.current_proxy_index = 0
 
+        # Reset runtime tracking
+        self.start_time = time.time()
+        self.end_time = None
+        self.elapsed_time = 0.0
+
         self.search_task = asyncio.create_task(
             self._run_search(max_results, workers, request_timeout)
         )
+        return True
+
+    async def stop_search(self) -> bool:
+        """Stop the currently running search."""
+        if not self.running:
+            return False
+
+        self._stop_requested = True
+        logger.info("Stop requested, waiting for workers to finish...")
+
+        # Wait for the search task to complete
+        if self.search_task and not self.search_task.done():
+            try:
+                await asyncio.wait_for(self.search_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Search task did not stop in time, cancelling...")
+                self.search_task.cancel()
+                try:
+                    await self.search_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                pass
+
+        self.running = False
+        self._stop_requested = False
         return True
 
     async def _run_search(self, max_results: int, workers: int, request_timeout: int):
@@ -275,7 +396,7 @@ class SearchManager:
             await queue.put(dork)
 
         async def worker():
-            while True:
+            while not self._stop_requested:
                 try:
                     dork = queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -293,12 +414,28 @@ class SearchManager:
             for _ in range(worker_count)
         ]
 
-        await queue.join()
+        try:
+            await queue.join()
+        except asyncio.CancelledError:
+            # Cancel all workers
+            for task in worker_tasks:
+                task.cancel()
+            raise
 
         for task in worker_tasks:
-            await task
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         self.running = False
+        # Freeze the runtime
+        self.end_time = time.time()
+        if self.start_time:
+            self.elapsed_time = self.end_time - self.start_time
+
         # Apply domain deduplication before final save
         async with self.lock:
             before_count = len(self.unique_sites)
@@ -307,10 +444,17 @@ class SearchManager:
             if before_count != after_count:
                 logger.info(f"Final deduplication removed {before_count - after_count} duplicate domains")
         await self.write_sites_file()
-        logger.info(f"Search completed with {worker_count} workers.")
+
+        if self._stop_requested:
+            logger.info(f"Search stopped by user. Processed {self.processed}/{self.total} dorks in {self.get_runtime_str()}.")
+        else:
+            logger.info(f"Search completed with {worker_count} workers in {self.get_runtime_str()}.")
 
     async def _process_dork(self, dork: str, max_results: int, request_timeout: int):
         """Perform one DDGS search, handle errors, update state."""
+        if self._stop_requested:
+            return
+
         async with self.lock:
             self.current_dork = dork
 
@@ -341,6 +485,9 @@ class SearchManager:
             # Save after every dork
             await self.write_sites_file()
 
+        except asyncio.CancelledError:
+            logger.info(f"Search cancelled while processing '{dork}'")
+            raise
         except Exception as e:
             logger.error(f"Error searching '{dork}': {e}")
             async with self.lock:
@@ -399,6 +546,11 @@ class SearchManager:
                 "workers": config.WORKERS,
                 "proxy_enabled": config.PROXY_ENABLED or len(self.proxies) > 0,
                 "proxy_count": len(self.proxies),
+                # Runtime info
+                "runtime": self.get_runtime(),
+                "runtime_str": self.get_runtime_str(),
+                "eta_str": self.get_eta_str(),
+                "speed": self.get_speed(),
             }
 
     def is_running(self) -> bool:
