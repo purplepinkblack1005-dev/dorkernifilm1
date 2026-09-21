@@ -1,5 +1,7 @@
 import os
+from zoneinfo import ZoneInfo
 
+TIMEZONE = ZoneInfo(os.getenv("TZ", "Asia/Manila"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Search settings
