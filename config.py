@@ -18,6 +18,10 @@ PROXY_ENABLED = os.getenv("PROXY_ENABLED", "false").lower() == "true"
 PROXY = os.getenv("PROXY", "")
 
 # File paths (relative to the app directory)
-DORKS_FILE = "dorks.txt"
-SITES_FILE = "sites.txt"
-PROXIES_FILE = "proxies.txt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DORKS_FILE = os.path.join(BASE_DIR, "dorks.txt")
+SITES_FILE = os.path.join(BASE_DIR, "sites.txt")
+PROXIES_FILE = os.path.join(BASE_DIR, "proxies.txt")
+
+# Optional remote dork source (fetched on /start and via /adddork <url>)
+DORKS_URL = os.getenv("DORKS_URL", "")
