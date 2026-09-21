@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
-import random
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse, parse_qs
 from typing import List, Dict, Optional, Set
@@ -14,19 +15,14 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------
-# Timezone (Philippine Time by default)
-# -------------------------------
 TZ = ZoneInfo(os.getenv("TZ", "Asia/Manila"))
 
 
 def now_str() -> str:
-    """Return current time in configured timezone as HH:MM:SS."""
-    return datetime.now(TZ).strftime("%H:%M:%S")
+    return datetime.now(TZ).strftime("%I:%M:%S %p")
 
 
 def format_duration(seconds: float) -> str:
-    """Format seconds into a human-readable duration string."""
     if seconds < 0:
         seconds = 0
     seconds = int(seconds)
@@ -36,29 +32,21 @@ def format_duration(seconds: float) -> str:
         return f"{hours}h {minutes}m {secs}s"
     elif minutes > 0:
         return f"{minutes}m {secs}s"
-    else:
-        return f"{secs}s"
+    return f"{secs}s"
 
 
 def normalize_url(url: str) -> str:
-    """Normalize a URL to avoid trivial duplicates."""
     try:
         parsed = urlparse(url.strip())
         scheme = parsed.scheme.lower()
         netloc = parsed.netloc.lower()
-
-        if (scheme == "http" and netloc.endswith(":80")) or (
-            scheme == "https" and netloc.endswith(":443")
-        ):
+        if (scheme == "http" and netloc.endswith(":80")) or (scheme == "https" and netloc.endswith(":443")):
             netloc = netloc.rsplit(":", 1)[0]
-
         if netloc.startswith("www."):
             netloc = netloc[4:]
-
         path = parsed.path or "/"
         if len(path) > 1 and path.endswith("/"):
             path = path[:-1]
-
         query = parsed.query
         return urlunparse((scheme, netloc, path, "", query, ""))
     except Exception:
@@ -82,8 +70,7 @@ def get_param_count(url: str) -> int:
         parsed = urlparse(url)
         if not parsed.query:
             return 0
-        params = parse_qs(parsed.query)
-        return len(params)
+        return len(parse_qs(parsed.query))
     except Exception:
         return 0
 
@@ -92,7 +79,6 @@ def parse_proxy_line(line: str) -> Optional[str]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-
     parts = line.split(":")
     if len(parts) == 4:
         host, port, username, password = parts
@@ -107,23 +93,18 @@ def parse_proxy_line(line: str) -> Optional[str]:
 
 def deduplicate_by_domain(urls: Set[str]) -> Set[str]:
     domain_map: Dict[str, str] = {}
-
     for url in urls:
         domain_key = get_domain_key(url)
         param_count = get_param_count(url)
-
         if domain_key not in domain_map:
             domain_map[domain_key] = url
         else:
             existing_url = domain_map[domain_key]
             existing_param_count = get_param_count(existing_url)
-
             if param_count > existing_param_count:
                 domain_map[domain_key] = url
-            elif param_count == existing_param_count:
-                if len(url) > len(existing_url):
-                    domain_map[domain_key] = url
-
+            elif param_count == existing_param_count and len(url) > len(existing_url):
+                domain_map[domain_key] = url
     return set(domain_map.values())
 
 
@@ -147,83 +128,102 @@ class SearchManager:
         self.file_lock = asyncio.Lock()
         self.last_update_time = time.time()
 
-        # Runtime tracking
         self.start_time: Optional[float] = None
         self.end_time: Optional[float] = None
         self.elapsed_time: float = 0.0
 
-        # Load proxies and existing sites on startup
         self.load_proxies_from_file()
         self.load_sites_from_file()
 
-    # -------------------------------
     # Runtime helpers
-    # -------------------------------
     def get_runtime(self) -> float:
-        """Return total runtime in seconds (live if running, final if stopped)."""
         if self.running and self.start_time:
             return time.time() - self.start_time
         return self.elapsed_time
 
     def get_runtime_str(self) -> str:
-        """Return human-readable runtime string."""
         return format_duration(self.get_runtime())
 
     def get_eta(self) -> Optional[float]:
-        """Estimate remaining seconds based on current speed."""
         runtime = self.get_runtime()
         if not self.running or self.processed == 0 or runtime <= 0:
             return None
-        rate = self.processed / runtime  # dorks per second
+        rate = self.processed / runtime
         if rate <= 0:
             return None
-        remaining = self.total - self.processed
-        return remaining / rate
+        return (self.total - self.processed) / rate
 
     def get_eta_str(self) -> str:
-        """Return human-readable ETA string."""
         eta = self.get_eta()
-        if eta is None:
-            return "-"
-        return format_duration(eta)
+        return "-" if eta is None else format_duration(eta)
 
     def get_speed(self) -> float:
-        """Return dorks processed per second."""
         runtime = self.get_runtime()
-        if runtime <= 0:
-            return 0.0
-        return self.processed / runtime
+        return 0.0 if runtime <= 0 else self.processed / runtime
 
-    # -------------------------------
-    # Load existing sites from disk
-    # -------------------------------
-    def load_sites_from_file(self, filename: str = config.SITES_FILE):
-        """Load previously saved sites from sites.txt on startup."""
+    # Remote dork fetching
+    def fetch_dorks_from_url(self, url: str, timeout: int = 60, retries: int = 3) -> List[str]:
+        if not url:
+            return []
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DorkBot)"}, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Attempt {attempt}: status {resp.status} for {url}")
+                        time.sleep(3)
+                        continue
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                head = raw[:200].lower()
+                if "<html" in head or "<!doctype" in head:
+                    logger.error(f"URL returned HTML, not plain text: {url}")
+                    return []
+                lines = [l.strip() for l in raw.splitlines() if l.strip() and not l.strip().startswith("#")]
+                logger.info(f"Fetched {len(lines)} dorks from {url} (attempt {attempt})")
+                return lines
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Attempt {attempt} failed for {url}: {e}")
+                time.sleep(3)
+        logger.error(f"All {retries} attempts failed for {url}: {last_err}")
+        return []
+
+    def load_dorks_from_remote(self, url: str) -> int:
+        fetched = self.fetch_dorks_from_url(url)
+        if not fetched:
+            return 0
+        before = len(self.dorks)
+        self.dorks = list(dict.fromkeys(self.dorks + fetched))
+        self.total = len(self.dorks)
+        added = self.total - before
+        self.save_dorks_to_file()
+        return added
+
+    # Sites
+    def load_sites_from_file(self, filename: str = None):
+        filename = filename or config.SITES_FILE
         try:
             with open(filename, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip()]
-            self.unique_sites = set(lines)
-            self.unique_sites = deduplicate_by_domain(self.unique_sites)
+                lines = [l.strip() for l in f if l.strip()]
+            self.unique_sites = deduplicate_by_domain(set(lines))
             logger.info(f"Loaded {len(self.unique_sites)} existing sites from {filename}")
         except FileNotFoundError:
-            logger.info(f"No existing sites file found. Starting fresh.")
+            logger.info("No existing sites file found. Starting fresh.")
             self.unique_sites = set()
 
-    # -------------------------------
-    # Dork loading & management
-    # -------------------------------
-    def load_dorks_from_file(self, filename: str = config.DORKS_FILE) -> int:
-        """Read dorks from a text file, clean, deduplicate."""
+    # Dorks
+    def load_dorks_from_file(self, filename: str = None) -> int:
+        filename = filename or config.DORKS_FILE
         try:
             with open(filename, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
             return self.set_dorks(lines)
         except FileNotFoundError:
-            logger.error(f"Dorks file '{filename}' not found.")
+            logger.warning(f"Dorks file '{filename}' not found.")
             return 0
 
     def set_dorks(self, dorks_list: List[str]) -> int:
-        """Set new dork list, remove duplicates, return count."""
         self.dorks = list(dict.fromkeys(dorks_list))
         self.total = len(self.dorks)
         self.processed = 0
@@ -231,15 +231,12 @@ class SearchManager:
         return self.total
 
     def add_dorks(self, new_dorks: List[str]) -> int:
-        """Add new dorks to existing list, return total count."""
-        combined = self.dorks + new_dorks
-        self.dorks = list(dict.fromkeys(combined))
+        self.dorks = list(dict.fromkeys(self.dorks + new_dorks))
         self.total = len(self.dorks)
         self.save_dorks_to_file()
         return self.total
 
     def clear_dorks(self) -> bool:
-        """Clear all dorks and save to file."""
         self.dorks = []
         self.total = 0
         self.processed = 0
@@ -247,8 +244,8 @@ class SearchManager:
         self.save_dorks_to_file()
         return True
 
-    def save_dorks_to_file(self, filename: str = config.DORKS_FILE):
-        """Save current dorks to file."""
+    def save_dorks_to_file(self, filename: str = None):
+        filename = filename or config.DORKS_FILE
         try:
             with open(filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(self.dorks))
@@ -256,66 +253,43 @@ class SearchManager:
         except Exception as e:
             logger.error(f"Failed to write {filename}: {e}")
 
-    # -------------------------------
-    # Proxy loading & management
-    # -------------------------------
-    def load_proxies_from_file(self, filename: str = config.PROXIES_FILE) -> int:
-        """Read proxies from file, parse them, and store formatted URLs."""
+    # Proxies
+    def load_proxies_from_file(self, filename: str = None) -> int:
+        filename = filename or config.PROXIES_FILE
         try:
             with open(filename, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+                lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         except FileNotFoundError:
             logger.info(f"Proxies file '{filename}' not found. Running without proxies.")
             self.proxies = []
             return 0
-
-        parsed_proxies = []
-        for line in lines:
-            proxy_url = parse_proxy_line(line)
-            if proxy_url:
-                parsed_proxies.append(proxy_url)
-
-        self.proxies = parsed_proxies
+        parsed = [parse_proxy_line(l) for l in lines]
+        self.proxies = [p for p in parsed if p]
         logger.info(f"Loaded {len(self.proxies)} proxies from {filename}")
         return len(self.proxies)
 
     def set_proxies(self, proxy_lines: List[str]) -> int:
-        """Set proxies from a list of raw lines."""
-        parsed_proxies = []
-        for line in proxy_lines:
-            proxy_url = parse_proxy_line(line)
-            if proxy_url:
-                parsed_proxies.append(proxy_url)
-
-        self.proxies = parsed_proxies
+        parsed = [parse_proxy_line(l) for l in proxy_lines]
+        self.proxies = [p for p in parsed if p]
         self.current_proxy_index = 0
-        logger.info(f"Set {len(self.proxies)} proxies")
         self.save_proxies_to_file()
         return len(self.proxies)
 
     def add_proxies(self, proxy_lines: List[str]) -> int:
-        """Add proxies to existing list."""
-        parsed_proxies = []
-        for line in proxy_lines:
-            proxy_url = parse_proxy_line(line)
-            if proxy_url:
-                parsed_proxies.append(proxy_url)
-
-        combined = self.proxies + parsed_proxies
-        self.proxies = list(dict.fromkeys(combined))
-        logger.info(f"Added {len(parsed_proxies)} proxies, total: {len(self.proxies)}")
+        parsed = [parse_proxy_line(l) for l in proxy_lines]
+        valid = [p for p in parsed if p]
+        self.proxies = list(dict.fromkeys(self.proxies + valid))
         self.save_proxies_to_file()
         return len(self.proxies)
 
     def clear_proxies(self) -> bool:
-        """Clear all proxies and save to file."""
         self.proxies = []
         self.current_proxy_index = 0
         self.save_proxies_to_file()
         return True
 
-    def save_proxies_to_file(self, filename: str = config.PROXIES_FILE):
-        """Save current proxies to file in original format."""
+    def save_proxies_to_file(self, filename: str = None):
+        filename = filename or config.PROXIES_FILE
         try:
             lines = []
             for proxy_url in self.proxies:
@@ -324,7 +298,6 @@ class SearchManager:
                     lines.append(f"{parsed.hostname}:{parsed.port}:{parsed.username}:{parsed.password}")
                 else:
                     lines.append(f"{parsed.hostname}:{parsed.port}")
-
             with open(filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             logger.info(f"Saved {len(lines)} proxies to {filename}")
@@ -332,27 +305,24 @@ class SearchManager:
             logger.error(f"Failed to write {filename}: {e}")
 
     def get_next_proxy(self) -> Optional[str]:
-        """Return the next proxy in rotation."""
         if not self.proxies:
             return None
         proxy = self.proxies[self.current_proxy_index % len(self.proxies)]
         self.current_proxy_index += 1
         return proxy
 
-    # -------------------------------
     # Search control
-    # -------------------------------
-    async def start_search(
-        self,
-        max_results: int = config.MAX_RESULTS_PER_DORK,
-        workers: int = config.WORKERS,
-        request_timeout: int = config.REQUEST_TIMEOUT,
-    ) -> bool:
-        """Start a new search if none is running."""
+    async def start_search(self, max_results=config.MAX_RESULTS_PER_DORK, workers=config.WORKERS, request_timeout=config.REQUEST_TIMEOUT) -> bool:
         if self.running:
             return False
-        if not self.dorks:
-            self.load_dorks_from_file()
+
+        self.load_dorks_from_file()
+
+        remote_url = getattr(config, "DORKS_URL", "") or ""
+        if remote_url:
+            logger.info(f"Merging dorks from remote URL: {remote_url}")
+            await asyncio.to_thread(self.load_dorks_from_remote, remote_url)
+
         if not self.dorks:
             return False
 
@@ -362,30 +332,21 @@ class SearchManager:
         self.failed = 0
         self.last_update_time = time.time()
         self.current_proxy_index = 0
-
-        # Reset runtime tracking
         self.start_time = time.time()
         self.end_time = None
         self.elapsed_time = 0.0
 
-        self.search_task = asyncio.create_task(
-            self._run_search(max_results, workers, request_timeout)
-        )
+        self.search_task = asyncio.create_task(self._run_search(max_results, workers, request_timeout))
         return True
 
     async def stop_search(self) -> bool:
-        """Stop the currently running search."""
         if not self.running:
             return False
-
         self._stop_requested = True
-        logger.info("Stop requested, waiting for workers to finish...")
-
         if self.search_task and not self.search_task.done():
             try:
                 await asyncio.wait_for(self.search_task, timeout=10.0)
             except asyncio.TimeoutError:
-                logger.warning("Search task did not stop in time, cancelling...")
                 self.search_task.cancel()
                 try:
                     await self.search_task
@@ -393,15 +354,12 @@ class SearchManager:
                     pass
             except asyncio.CancelledError:
                 pass
-
         self.running = False
         self._stop_requested = False
         return True
 
     async def _run_search(self, max_results: int, workers: int, request_timeout: int):
-        """Process dorks using a fixed number of concurrent workers."""
         queue = asyncio.Queue()
-
         for dork in self.dorks:
             await queue.put(dork)
 
@@ -411,89 +369,58 @@ class SearchManager:
                     dork = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-
                 try:
                     await self._process_dork(dork, max_results, request_timeout)
                 finally:
                     queue.task_done()
 
         worker_count = max(1, min(workers, len(self.dorks)))
-
-        worker_tasks = [
-            asyncio.create_task(worker())
-            for _ in range(worker_count)
-        ]
+        worker_tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
         try:
             await queue.join()
         except asyncio.CancelledError:
-            for task in worker_tasks:
-                task.cancel()
+            for t in worker_tasks:
+                t.cancel()
             raise
 
-        for task in worker_tasks:
-            if not task.done():
-                task.cancel()
+        for t in worker_tasks:
+            if not t.done():
+                t.cancel()
                 try:
-                    await task
+                    await t
                 except asyncio.CancelledError:
                     pass
 
         self.running = False
-        # Freeze the runtime
         self.end_time = time.time()
         if self.start_time:
             self.elapsed_time = self.end_time - self.start_time
 
-        # Apply domain deduplication before final save
         async with self.lock:
-            before_count = len(self.unique_sites)
             self.unique_sites = deduplicate_by_domain(self.unique_sites)
-            after_count = len(self.unique_sites)
-            if before_count != after_count:
-                logger.info(f"Final deduplication removed {before_count - after_count} duplicate domains")
         await self.write_sites_file()
 
-        if self._stop_requested:
-            logger.info(f"Search stopped by user. Processed {self.processed}/{self.total} dorks in {self.get_runtime_str()}.")
-        else:
-            logger.info(f"Search completed with {worker_count} workers in {self.get_runtime_str()}.")
-
     async def _process_dork(self, dork: str, max_results: int, request_timeout: int):
-        """Perform one DDGS search, handle errors, update state."""
         if self._stop_requested:
             return
-
         async with self.lock:
             self.current_dork = dork
-
         try:
             results = await asyncio.wait_for(
                 asyncio.to_thread(self._ddgs_search, dork, max_results, request_timeout),
                 timeout=request_timeout + 10,
             )
-
-            new_sites = 0
             for r in results:
                 url = r.get("href", "")
                 if url:
                     normalized = normalize_url(url)
                     async with self.lock:
-                        if normalized not in self.unique_sites:
-                            self.unique_sites.add(normalized)
-                            new_sites += 1
-
+                        self.unique_sites.add(normalized)
             async with self.lock:
-                before_count = len(self.unique_sites)
                 self.unique_sites = deduplicate_by_domain(self.unique_sites)
-                after_count = len(self.unique_sites)
-                if before_count != after_count:
-                    logger.info(f"Deduplication removed {before_count - after_count} duplicate domains")
-
             await self.write_sites_file()
-
         except asyncio.CancelledError:
-            logger.info(f"Search cancelled while processing '{dork}'")
             raise
         except Exception as e:
             logger.error(f"Error searching '{dork}': {e}")
@@ -506,29 +433,23 @@ class SearchManager:
                 self.last_update_time = time.time()
 
     def _ddgs_search(self, query: str, max_results: int, request_timeout: int) -> List[Dict]:
-        """Synchronous DDGS search, runs in a thread."""
         proxy = self.get_next_proxy()
-
         if proxy:
             os.environ["HTTP_PROXY"] = proxy
             os.environ["HTTPS_PROXY"] = proxy
         else:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("HTTPS_PROXY", None)
-
         with DDGS(timeout=request_timeout) as ddgs:
             return list(ddgs.text(query, max_results=max_results))
 
-    # -------------------------------
     # Export & status
-    # -------------------------------
     async def export_sites(self) -> List[str]:
-        """Return a sorted list of all unique normalized URLs."""
         async with self.lock:
             return sorted(self.unique_sites)
 
-    async def write_sites_file(self, filename: str = config.SITES_FILE):
-        """Write current unique sites to sites.txt (thread-safe)."""
+    async def write_sites_file(self, filename: str = None):
+        filename = filename or config.SITES_FILE
         async with self.lock:
             sites = sorted(self.unique_sites)
         async with self.file_lock:
@@ -540,7 +461,6 @@ class SearchManager:
                 logger.error(f"Failed to write {filename}: {e}")
 
     async def get_status(self) -> Dict:
-        """Return current status as a dictionary."""
         async with self.lock:
             return {
                 "running": self.running,
@@ -553,7 +473,6 @@ class SearchManager:
                 "workers": config.WORKERS,
                 "proxy_enabled": config.PROXY_ENABLED or len(self.proxies) > 0,
                 "proxy_count": len(self.proxies),
-                # Runtime info
                 "runtime": self.get_runtime(),
                 "runtime_str": self.get_runtime_str(),
                 "eta_str": self.get_eta_str(),
