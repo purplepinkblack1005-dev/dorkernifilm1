@@ -288,7 +288,7 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
     state = {
         "phase": "connecting",
         "attempt": 1,
-        "max_attempts": 3,
+        "max_attempts": 1,
         "lines": 0,
         "done": False,
         "added": 0,
