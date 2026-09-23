@@ -59,10 +59,9 @@ def start_health_server():
 
 
 # -------------------------------
-# Helper: safe edit with fallback
+# Helpers
 # -------------------------------
 async def _safe_edit(msg, text: str, parse_mode: str = "Markdown"):
-    """Edit a Telegram message; swallow errors so the flow never breaks."""
     try:
         await msg.edit_text(text, parse_mode=parse_mode)
         return True
@@ -71,9 +70,6 @@ async def _safe_edit(msg, text: str, parse_mode: str = "Markdown"):
         return False
 
 
-# -------------------------------
-# Helper: extract lines from a replied .txt
-# -------------------------------
 async def _read_document_from_reply(update: Update):
     reply = update.message.reply_to_message
     if not reply or not reply.document:
@@ -164,6 +160,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Proxies (owner only):**\n"
         "/addproxy `<host:port:user:pass>` – Add one proxy\n"
         "/addproxy `<host:port>` – Add one proxy (no auth)\n"
+        "/addproxy `<url>` – Fetch & merge proxies from URL\n"
         "↩️ *Reply to any .txt file* with /addproxy – Load proxies from file\n"
         "/listproxies – List proxies\n"
         "/clearproxies – Clear proxies\n\n"
@@ -176,11 +173,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /adddorks — literal, URL, or reply-to-file
+# /adddorks
 # -------------------------------
 @owner_only
 async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Case 1 — reply to a .txt file
     filename, lines = await _read_document_from_reply(update)
     if filename:
         if not lines:
@@ -194,7 +190,6 @@ async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Case 2 — no args
     if not context.args:
         await update.message.reply_text(
             "⚠️ Usage:\n"
@@ -210,12 +205,10 @@ async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please provide a dork or URL.")
         return
 
-    # Case 3 — URL mode (with live editing)
     if arg.startswith("http://") or arg.startswith("https://"):
         await _fetch_url_with_live_updates(update, arg, mode="dorks")
         return
 
-    # Case 4 — literal dork
     count = manager.add_dorks([arg])
     await update.message.reply_text(
         f"✅ Added dork: `{arg}`\n"
@@ -225,19 +218,53 @@ async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# Live-editing URL fetcher (shared by dorks & proxies)
+# /addproxy
+# -------------------------------
+@owner_only
+async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    filename, lines = await _read_document_from_reply(update)
+    if filename:
+        if not lines:
+            await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
+            return
+        count = manager.add_proxies(lines)
+        await update.message.reply_text(
+            f"✅ Added {len(lines)} proxy lines from `{filename}`.\n"
+            f"Total proxies: **{count}**",
+            parse_mode="Markdown"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage:\n"
+            "• `/addproxy host:port:user:pass` — add one proxy\n"
+            "• `/addproxy host:port` — add one proxy (no auth)\n"
+            "• `/addproxy https://example.com/proxies.txt` — fetch from URL\n"
+            "• *Reply to any .txt file* with `/addproxy` — load from that file",
+            parse_mode="Markdown"
+        )
+        return
+
+    arg = " ".join(context.args).strip()
+
+    if arg.startswith("http://") or arg.startswith("https://"):
+        await _fetch_url_with_live_updates(update, arg, mode="proxies")
+        return
+
+    count = manager.add_proxies([arg])
+    await update.message.reply_text(f"✅ Added proxy.\nTotal proxies: {count}")
+
+
+# -------------------------------
+# Live-editing URL fetcher
 # -------------------------------
 async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "dorks"):
-    """
-    Fetch dorks/proxies from url, editing the SAME Telegram message
-    to show step-by-step progress. mode = "dorks" or "proxies".
-    """
     start_ts = time.time()
 
     def elapsed() -> int:
         return int(time.time() - start_ts)
 
-    # Initial message
     msg = await update.message.reply_text(
         f"📥 **Fetching {mode}...**\n\n"
         f"🔗 `{url}`\n\n"
@@ -249,14 +276,14 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
     state = {
         "phase": "connecting",
         "attempt": 1,
-        "max_attempts": 5,
+        "max_attempts": 3,
         "lines": 0,
         "done": False,
         "added": 0,
         "error": None,
+        "partial": False,
     }
 
-    # The actual fetch — runs in a thread, but we hook its progress via state
     def on_attempt(attempt: int, max_attempts: int):
         state["attempt"] = attempt
         state["max_attempts"] = max_attempts
@@ -269,18 +296,19 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
         state["lines"] = n
         state["phase"] = "saving"
 
+    def on_partial():
+        state["partial"] = True
+
     async def fetcher():
         try:
-            # Use the manager's fetch with callback hooks
             raw_lines = await asyncio.to_thread(
                 manager.fetch_dorks_from_url_with_hooks,
-                url, on_attempt, on_response_received, on_lines_parsed
+                url, on_attempt, on_response_received, on_lines_parsed, on_partial
             )
             if not raw_lines:
-                state["error"] = "no dorks"
+                state["error"] = "no lines"
                 return
 
-            # Merge into the manager
             if mode == "proxies":
                 before = len(manager.proxies)
                 manager.add_proxies(raw_lines)
@@ -297,7 +325,6 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
 
     fetch_task = asyncio.create_task(fetcher())
 
-    # Live message editor — updates at most every 3 seconds
     last_edit = 0.0
     while not fetch_task.done():
         await asyncio.sleep(1)
@@ -305,12 +332,8 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
         if now - last_edit < 3:
             continue
         last_edit = now
+        await _safe_edit(msg, _build_fetch_status_message(url, mode, elapsed(), state))
 
-        e = elapsed()
-        text = _build_fetch_status_message(url, mode, e, state)
-        await _safe_edit(msg, text)
-
-    # Make sure task completed
     try:
         await fetch_task
     except Exception as e:
@@ -318,7 +341,6 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
 
     e = elapsed()
 
-    # Final edit
     if state["error"] and state["added"] == 0:
         final = (
             f"❌ **Failed to fetch {mode}**\n\n"
@@ -334,18 +356,19 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
         )
     else:
         total = len(manager.proxies) if mode == "proxies" else len(manager.dorks)
+        partial_note = "\n⚠️ _Partial read — connection stalled, kept what we got_" if state.get("partial") else ""
         final = (
             f"✅ **Merged {state['added']} new {mode}!**\n\n"
             f"🔗 `{url}`\n"
             f"⏱️ Took {e}s  •  {state['lines']} lines read\n"
             f"📄 Total {mode}: **{total}**"
+            f"{partial_note}"
         )
 
     await _safe_edit(msg, final)
 
 
 def _build_fetch_status_message(url: str, mode: str, elapsed: int, state: dict) -> str:
-    """Compose the live status text based on current fetch phase."""
     phase = state["phase"]
     attempt = state["attempt"]
     max_attempts = state["max_attempts"]
@@ -367,48 +390,6 @@ def _build_fetch_status_message(url: str, mode: str, elapsed: int, state: dict) 
         f"⏱️ Elapsed: {elapsed}s\n"
         f"{status_line}"
     )
-
-
-# -------------------------------
-# /addproxy — literal or reply-to-file
-# -------------------------------
-@owner_only
-async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Case 1 — reply to a .txt file
-    filename, lines = await _read_document_from_reply(update)
-    if filename:
-        if not lines:
-            await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
-            return
-        count = manager.add_proxies(lines)
-        await update.message.reply_text(
-            f"✅ Added {len(lines)} proxy lines from `{filename}`.\n"
-            f"Total proxies: **{count}**",
-            parse_mode="Markdown"
-        )
-        return
-
-    # Case 2 — no args
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage:\n"
-            "• `/addproxy host:port:user:pass` — add one proxy\n"
-            "• `/addproxy host:port` — add one proxy (no auth)\n"
-            "• *Reply to any .txt file* with `/addproxy` — load from that file",
-            parse_mode="Markdown"
-        )
-        return
-
-    arg = " ".join(context.args).strip()
-
-    # Case 3 — URL mode
-    if arg.startswith("http://") or arg.startswith("https://"):
-        await _fetch_url_with_live_updates(update, arg, mode="proxies")
-        return
-
-    # Case 4 — single proxy
-    count = manager.add_proxies([arg])
-    await update.message.reply_text(f"✅ Added proxy.\nTotal proxies: {count}")
 
 
 # -------------------------------
@@ -505,7 +486,7 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# Auto file upload (no reply) → dorks
+# Auto file upload → dorks
 # -------------------------------
 @owner_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,4 +658,8 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.main()
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO
+    )
+    main()
