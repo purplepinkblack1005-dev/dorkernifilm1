@@ -165,11 +165,12 @@ class SearchManager:
         return 0.0 if runtime <= 0 else self.processed / runtime
 
     # -------------------------------
-    # Remote dork fetching (streaming + partial tolerance)
+    # Remote dork fetching
     # -------------------------------
-    def fetch_dorks_from_url(self, url: str, timeout: int = 120, retries: int = 3) -> List[str]:
-        """Simple wrapper (no hooks) — for internal callers."""
-        return self.fetch_dorks_from_url_with_hooks(url, timeout=timeout, retries=retries)
+    def fetch_dorks_from_url(self, url: str, timeout: int = 30, total_timeout: int = 120, retries: int = 3) -> List[str]:
+        return self.fetch_dorks_from_url_with_hooks(
+            url, timeout=timeout, total_timeout=total_timeout, retries=retries
+        )
 
     def fetch_dorks_from_url_with_hooks(
         self,
@@ -178,12 +179,15 @@ class SearchManager:
         on_response=None,
         on_lines=None,
         on_partial=None,
-        timeout: int = 120,
+        timeout: int = 30,
+        total_timeout: int = 120,
         retries: int = 3,
     ) -> List[str]:
         """
-        Fetch dorks with streaming read and partial-content tolerance.
-        If a read times out but we already got data, keep what we have.
+        Fetch dorks with:
+          - per-read socket timeout (timeout)
+          - HARD total wall-clock cap (total_timeout) across the whole body read
+        If we hit the total cap, we keep whatever bytes we already got.
         """
         if not url:
             return []
@@ -195,6 +199,8 @@ class SearchManager:
                     on_attempt(attempt, retries)
                 except Exception:
                     pass
+
+            attempt_start = time.time()
 
             try:
                 req = urllib.request.Request(
@@ -215,15 +221,25 @@ class SearchManager:
                         except Exception:
                             pass
 
-                    # ---- streaming read with partial tolerance ----
+                    # ---- streaming read with HARD total cap ----
                     chunks: List[bytes] = []
                     total_bytes = 0
                     read_timed_out = False
                     read_error = None
+                    read_start = time.time()
 
                     while True:
+                        if time.time() - read_start >= total_timeout:
+                            read_timed_out = True
+                            read_error = f"total read time exceeded ({total_timeout}s)"
+                            logger.warning(
+                                f"Hit total read cap of {total_timeout}s "
+                                f"({total_bytes} bytes received). Keeping partial."
+                            )
+                            break
+
                         try:
-                            chunk = resp.read(65536)  # 64 KB per read
+                            chunk = resp.read(65536)
                         except socket.timeout as e:
                             read_timed_out = True
                             read_error = e
@@ -232,14 +248,19 @@ class SearchManager:
                             read_timed_out = True
                             read_error = e
                             break
+
                         if not chunk:
                             break
+
                         chunks.append(chunk)
                         total_bytes += len(chunk)
 
                 if total_bytes == 0:
                     last_err = f"no data received ({read_error or 'empty response'})"
-                    logger.warning(f"Attempt {attempt}/{retries} got 0 bytes from {url}")
+                    logger.warning(
+                        f"Attempt {attempt}/{retries} got 0 bytes from {url} "
+                        f"after {int(time.time() - attempt_start)}s"
+                    )
                     if attempt < retries:
                         time.sleep(min(3 * (2 ** (attempt - 1)), 30))
                     continue
@@ -276,7 +297,8 @@ class SearchManager:
 
                 logger.info(
                     f"Fetched {len(lines)} dorks from {url} "
-                    f"(attempt {attempt}, {total_bytes} bytes"
+                    f"(attempt {attempt}, {total_bytes} bytes, "
+                    f"{int(time.time() - attempt_start)}s"
                     + (", PARTIAL" if read_timed_out else "")
                     + ")"
                 )
