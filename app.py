@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import resource
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -21,6 +22,11 @@ progress_message_id: Optional[int] = None
 progress_chat_id: Optional[int] = None
 progress_task: Optional[asyncio.Task] = None
 last_progress_text: Optional[str] = None
+
+# Memory watchdog settings
+MEMORY_CHECK_INTERVAL = 300     # seconds between checks (5 min)
+MEMORY_WARN_THRESHOLD = 400     # MB — warn in logs
+MEMORY_KILL_THRESHOLD = 460     # MB — exit for auto-restart (limit is 512)
 
 
 # -------------------------------
@@ -56,6 +62,48 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"Health server listening on port {port}")
+
+
+# -------------------------------
+# Memory watchdog
+# -------------------------------
+def get_rss_mb() -> float:
+    """Return current RSS in MB."""
+    try:
+        # Linux: ru_maxrss is in KB
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
+
+
+async def _memory_watchdog():
+    """
+    Log memory usage every 5 min.
+    If memory crosses MEMORY_KILL_THRESHOLD, exit cleanly so Render restarts us
+    before the hard OOM kill.
+    """
+    # Give the app a moment to settle
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            rss = get_rss_mb()
+            logger.info(f"💾 Memory: {rss:.0f} MB / 512 MB")
+
+            if rss >= MEMORY_KILL_THRESHOLD:
+                logger.warning(
+                    f"🚨 Memory at {rss:.0f} MB (>= {MEMORY_KILL_THRESHOLD} MB) — "
+                    f"exiting for clean auto-restart"
+                )
+                # Give a second to flush logs
+                await asyncio.sleep(1)
+                os._exit(1)
+            elif rss >= MEMORY_WARN_THRESHOLD:
+                logger.warning(f"⚠️ Memory high: {rss:.0f} MB")
+        except Exception as e:
+            logger.error(f"Memory watchdog error: {e}")
+
+        await asyncio.sleep(MEMORY_CHECK_INTERVAL)
 
 
 # -------------------------------
@@ -148,7 +196,12 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = time.perf_counter()
     msg = await update.message.reply_text("🏓 Pong!")
     latency_ms = (time.perf_counter() - started) * 1000
-    await msg.edit_text(f"🏓 Pong!\n⚡ Response time: {latency_ms:.0f} ms")
+    mem = get_rss_mb()
+    await msg.edit_text(
+        f"🏓 Pong!\n"
+        f"⚡ Response time: {latency_ms:.0f} ms\n"
+        f"💾 Memory: {mem:.0f} MB / 512 MB"
+    )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -460,6 +513,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await manager.get_status()
     state = "RUNNING" if status["running"] else "IDLE"
     speed = status.get("speed", 0.0)
+    mem = get_rss_mb()
     await update.message.reply_text(
         f"🔎 DDGS Search Status\n"
         f"State: {state}\n"
@@ -474,6 +528,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Proxy: {'ON' if status['proxy_enabled'] else 'OFF'}\n"
         f"Proxies loaded: {status.get('proxy_count', 0)}\n"
         f"Proxy retries: {status.get('proxy_retries', 0)}\n"
+        f"💾 Memory: {mem:.0f} MB / 512 MB\n"
         f"🕐 Time: {now_str()} PHT"
     )
 
@@ -628,7 +683,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # -------------------------------
 # Main
 # -------------------------------
-def main():
+async def _run_app():
+    """Run the app with memory watchdog inside the event loop."""
     if not config.TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN environment variable not set!")
         return
@@ -640,6 +696,7 @@ def main():
     logger.info(f"🕐 Timezone: {os.getenv('TZ', 'Asia/Manila')}")
     logger.info(f"📁 Dorks file: {config.DORKS_FILE}")
     logger.info(f"📁 Proxy file: {config.PROXIES_FILE}")
+    logger.info(f"💾 Initial memory: {get_rss_mb():.0f} MB")
 
     start_health_server()
 
@@ -667,7 +724,28 @@ def main():
     application.add_error_handler(error_handler)
 
     logger.info("Bot started. Press Ctrl+C to stop.")
-    application.run_polling(drop_pending_updates=True)
+
+    # Start memory watchdog as background task
+    asyncio.create_task(_memory_watchdog())
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+
+    # Keep the loop alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+
+def main():
+    asyncio.run(_run_app())
 
 
 if __name__ == "__main__":
