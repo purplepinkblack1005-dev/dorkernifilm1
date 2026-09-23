@@ -142,32 +142,44 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /help
+# /ping and /help
 # -------------------------------
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    started = time.perf_counter()
+    msg = await update.message.reply_text("🏓 Pong!")
+    latency_ms = (time.perf_counter() - started) * 1000
+    await msg.edit_text(f"🏓 Pong!\n⚡ Response time: {latency_ms:.0f} ms")
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 **Available Commands**\n\n"
-        "**Search:**\n"
-        "/start – Start a new search\n"
-        "/stop – Stop the running search\n"
-        "/status – Show search status\n\n"
-        "**Dorks:**\n"
-        "/adddorks `<dork>` – Add one literal dork\n"
-        "/adddorks `<url>` – Fetch & merge dorks from a raw URL\n"
-        "↩️ *Reply to any .txt file* with /adddorks – Load dorks from file\n"
-        "/listdorks – List loaded dorks\n"
-        "/cleardorks – Clear all dorks\n\n"
-        "**Proxies (owner only):**\n"
-        "/addproxy `<host:port:user:pass>` – Add one proxy\n"
-        "/addproxy `<host:port>` – Add one proxy (no auth)\n"
-        "/addproxy `<url>` – Fetch & merge proxies from URL\n"
-        "↩️ *Reply to any .txt file* with /addproxy – Load proxies from file\n"
-        "/listproxies – List proxies\n"
-        "/clearproxies – Clear proxies\n\n"
-        "**Export (owner only):**\n"
-        "/export – Download sites.txt\n\n"
-        "**Info:**\n"
-        "/help – This message",
+        "📚 **Dork Search Bot Help**\n\n"
+        "Use the commands below to manage dorks, proxies, and searches.\n\n"
+        "🔎 **Search**\n"
+        "`/start` — Start searching all loaded dorks\n"
+        "`/stop` — Stop the current search\n"
+        "`/status` — Show progress, ETA, results, and proxy status\n"
+        "`/ping` — Check whether the bot is online\n\n"
+        "🧩 **Dorks**\n"
+        "`/adddorks <dork>` — Add one search dork\n"
+        "`/adddorks <url>` — Fetch and merge dorks from a raw text URL\n"
+        "Reply to a `.txt` file with `/adddorks` to import its lines\n"
+        "`/listdorks` — Show the first 30 loaded dorks\n"
+        "`/cleardorks` — Remove all loaded dorks\n\n"
+        "🌐 **Proxies** *(owner only)*\n"
+        "`/addproxy host:port` — Add a proxy without authentication\n"
+        "`/addproxy host:port:user:pass` — Add an authenticated proxy\n"
+        "`/addproxy <url>` — Fetch and merge proxies from a raw text URL\n"
+        "Reply to a `.txt` file with `/addproxy` to import proxies\n"
+        "`/listproxies` — Show loaded proxies\n"
+        "`/clearproxies` — Remove all proxies\n\n"
+        "📄 **Results** *(owner only)*\n"
+        "`/export` — Download the current `sites.txt` file\n\n"
+        "💡 **Quick start**\n"
+        "1. Add a dork with `/adddorks site:example.com inurl:admin`\n"
+        "2. Optionally load proxies with `/addproxy host:port`\n"
+        "3. Run `/start` and monitor it with `/status`\n\n"
+        "Use `/help` anytime to see this guide.",
         parse_mode="Markdown"
     )
 
@@ -356,7 +368,7 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
         )
     else:
         total = len(manager.proxies) if mode == "proxies" else len(manager.dorks)
-        partial_note = "\n⚠️ _Partial read — stopped at 120s cap, kept what we got_" if state.get("partial") else ""
+        partial_note = "\n⚠️ _Partial read — stopped at 60s cap, kept what we got_" if state.get("partial") else ""
         final = (
             f"✅ **Merged {state['added']} new {mode}!**\n\n"
             f"🔗 `{url}`\n"
@@ -378,7 +390,7 @@ def _build_fetch_status_message(url: str, mode: str, elapsed: int, state: dict) 
         if elapsed > 20:
             status_line += "\n💤 Source may be cold-starting (Render)"
     elif phase == "reading":
-        status_line = "📖 Server responded — reading content...\n⏳ Will stop at 120s cap"
+        status_line = "📖 Server responded — reading content...\n⏳ Will stop at 60s cap"
     elif phase == "saving":
         status_line = f"💾 Got {state['lines']} lines — saving to file..."
     else:
@@ -636,6 +648,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("ping", ping_cmd))
 
     application.add_handler(CommandHandler("adddorks", adddorks_cmd))
     application.add_handler(CommandHandler("adddork", adddorks_cmd))
