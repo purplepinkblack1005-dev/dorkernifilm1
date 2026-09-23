@@ -22,10 +22,10 @@ progress_chat_id: Optional[int] = None
 progress_task: Optional[asyncio.Task] = None
 last_progress_text: Optional[str] = None
 
-# Track the most recent /addproxy prompt message id, so replying to it = proxy upload
-pending_proxy_prompt_id: Optional[int] = None
 
-
+# -------------------------------
+# Owner-only decorator
+# -------------------------------
 def owner_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -37,6 +37,9 @@ def owner_only(func):
     return wrapper
 
 
+# -------------------------------
+# Health server
+# -------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -53,6 +56,30 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"Health server listening on port {port}")
+
+
+# -------------------------------
+# Helper: extract lines from a replied .txt document
+# -------------------------------
+async def _read_document_from_reply(update: Update):
+    """
+    If the message is a reply to a message that has a .txt document attached,
+    download and return (filename, lines). Otherwise return (None, None).
+    """
+    reply = update.message.reply_to_message
+    if not reply or not reply.document:
+        return None, None
+
+    doc: Document = reply.document
+    filename = (doc.file_name or "").lower()
+    if not filename.endswith(".txt"):
+        return None, None
+
+    file = await doc.get_file()
+    data = await file.download_as_bytearray()
+    text = data.decode("utf-8", errors="ignore")
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
+    return doc.file_name, lines
 
 
 # -------------------------------
@@ -78,7 +105,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     started = await manager.start_search()
     if not started:
         await update.message.reply_text(
-            "❌ No dorks loaded. Use `/adddork <dork>` or upload a .txt file.",
+            "❌ No dorks loaded. Use `/adddorks <url>`, `/adddorks <dork>`, or reply to a .txt with `/adddorks`.",
             parse_mode="Markdown"
         )
         return
@@ -117,19 +144,20 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 **Available Commands**\n\n"
-        "**Search Control:**\n"
+        "**Search:**\n"
         "/start – Start a new search\n"
         "/stop – Stop the running search\n"
         "/status – Show search status\n\n"
-        "**Dork Management:**\n"
-        "/adddork `<dork>` – Add one literal dork\n"
-        "/adddork `<url>` – Fetch & merge dorks from a raw URL\n"
+        "**Dorks:**\n"
+        "/adddorks `<dork>` – Add one literal dork\n"
+        "/adddorks `<url>` – Fetch & merge dorks from a raw URL\n"
+        "↩️ *Reply to any .txt file* with /adddorks – Load dorks from file\n"
         "/listdorks – List loaded dorks\n"
-        "/cleardorks – Clear all dorks\n"
-        "📎 Upload any .txt → adds as dorks\n\n"
-        "**Proxy Management (owner only):**\n"
+        "/cleardorks – Clear all dorks\n\n"
+        "**Proxies (owner only):**\n"
         "/addproxy `<host:port:user:pass>` – Add one proxy\n"
-        "/addproxy – Then reply with any .txt file → adds as proxies\n"
+        "/addproxy `<host:port>` – Add one proxy (no auth)\n"
+        "↩️ *Reply to any .txt file* with /addproxy – Load proxies from file\n"
         "/listproxies – List proxies\n"
         "/clearproxies – Clear proxies\n\n"
         "**Export (owner only):**\n"
@@ -141,15 +169,31 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /adddork — literal dork OR URL
+# /adddorks — literal dork, URL, OR reply-to-file
 # -------------------------------
 @owner_only
-async def adddork_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Case 1 — reply to a .txt file
+    filename, lines = await _read_document_from_reply(update)
+    if filename:
+        if not lines:
+            await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
+            return
+        count = manager.add_dorks(lines)
+        await update.message.reply_text(
+            f"✅ Added {len(lines)} dorks from `{filename}`.\n"
+            f"Total dorks: **{count}**",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Case 2 — no args
     if not context.args:
         await update.message.reply_text(
             "⚠️ Usage:\n"
-            "• `/adddork site:example.com inurl:admin` — add one dork\n"
-            "• `/adddork https://example.com/dorks.txt` — fetch & merge from URL",
+            "• `/adddorks site:example.com inurl:admin` — add one dork\n"
+            "• `/adddorks https://example.com/dorks.txt` — fetch from URL\n"
+            "• *Reply to any .txt file* with `/adddorks` — load from that file",
             parse_mode="Markdown"
         )
         return
@@ -159,6 +203,7 @@ async def adddork_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please provide a dork or URL.")
         return
 
+    # URL mode
     if arg.startswith("http://") or arg.startswith("https://"):
         msg = await update.message.reply_text(
             f"📥 Fetching dorks from:\n`{arg}`\n\nThis may take up to 60s (cold start)...",
@@ -178,6 +223,7 @@ async def adddork_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Literal dork
     count = manager.add_dorks([arg])
     await update.message.reply_text(
         f"✅ Added dork: `{arg}`\n"
@@ -187,31 +233,37 @@ async def adddork_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /addproxy — single proxy OR prompts for reply with .txt
+# /addproxy — literal proxy OR reply-to-file
 # -------------------------------
 @owner_only
 async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global pending_proxy_prompt_id
-
-    # No arguments → prompt user to reply with a .txt file
-    if not context.args:
-        msg = await update.message.reply_text(
-            "📎 **Reply to this message** with any `.txt` file containing proxies.\n\n"
-            "Accepted formats per line:\n"
-            "• `host:port`\n"
-            "• `host:port:username:password`\n\n"
-            "Lines starting with `#` are ignored.",
+    # Case 1 — reply to a .txt file
+    filename, lines = await _read_document_from_reply(update)
+    if filename:
+        if not lines:
+            await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
+            return
+        count = manager.add_proxies(lines)
+        await update.message.reply_text(
+            f"✅ Added {len(lines)} proxy lines from `{filename}`.\n"
+            f"Total proxies: **{count}**",
             parse_mode="Markdown"
         )
-        pending_proxy_prompt_id = msg.message_id
         return
 
-    # Has arguments → single proxy
+    # Case 2 — no args
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage:\n"
+            "• `/addproxy host:port:user:pass` — add one proxy\n"
+            "• `/addproxy host:port` — add one proxy (no auth)\n"
+            "• *Reply to any .txt file* with `/addproxy` — load from that file",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Single proxy
     proxy_line = " ".join(context.args).strip()
-    if not proxy_line:
-        await update.message.reply_text("⚠️ Please provide a valid proxy.")
-        return
-
     count = manager.add_proxies([proxy_line])
     await update.message.reply_text(f"✅ Added proxy.\nTotal proxies: {count}")
 
@@ -285,6 +337,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Workers: {status['workers']}\n"
         f"Proxy: {'ON' if status['proxy_enabled'] else 'OFF'}\n"
         f"Proxies loaded: {status.get('proxy_count', 0)}\n"
+        f"Proxy retries: {status.get('proxy_retries', 0)}\n"
         f"🕐 Time: {now_str()} PHT"
     )
 
@@ -309,17 +362,15 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# File upload handler — smart routing
+# Auto file upload (no reply) → dorks by default
 # -------------------------------
 @owner_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Any .txt upload:
-      - If it's a REPLY to a /addproxy prompt → add as PROXIES
-      - Otherwise → add as DORKS
+    Any .txt uploaded without a reply command → treated as DORKS.
+    To load PROXIES from a file, reply to it with /addproxy.
+    To load DORKS from a file explicitly, reply with /adddorks.
     """
-    global pending_proxy_prompt_id
-
     doc: Document = update.message.document
     filename = (doc.file_name or "file.txt").lower()
 
@@ -327,13 +378,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please upload a .txt file.")
         return
 
-    # Is this a reply to the /addproxy prompt?
-    is_proxy_reply = False
-    reply_to = update.message.reply_to_message
-    if reply_to and pending_proxy_prompt_id and reply_to.message_id == pending_proxy_prompt_id:
-        is_proxy_reply = True
-
-    # Download the file
     file = await doc.get_file()
     data = await file.download_as_bytearray()
     text = data.decode("utf-8", errors="ignore")
@@ -343,21 +387,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ File is empty or contains only comments/blank lines.")
         return
 
-    if is_proxy_reply:
-        count = manager.add_proxies(lines)
-        pending_proxy_prompt_id = None
-        await update.message.reply_text(
-            f"✅ Added proxies from `{doc.file_name}`.\n"
-            f"Total proxies: **{count}**",
-            parse_mode="Markdown"
-        )
-    else:
-        count = manager.add_dorks(lines)
-        await update.message.reply_text(
-            f"✅ Added dorks from `{doc.file_name}`.\n"
-            f"Total dorks: **{count}**",
-            parse_mode="Markdown"
-        )
+    count = manager.add_dorks(lines)
+    await update.message.reply_text(
+        f"✅ Added {len(lines)} dorks from `{doc.file_name}`.\n"
+        f"Total dorks: **{count}**\n\n"
+        f"💡 To load as *proxies* instead, reply to the file with `/addproxy`.",
+        parse_mode="Markdown"
+    )
 
 
 # -------------------------------
@@ -367,6 +403,7 @@ async def _format_progress_message() -> str:
     status = await manager.get_status()
     proxy_status = "ON" if status["proxy_enabled"] else "OFF"
     proxy_count = status.get("proxy_count", 0)
+    proxy_retries = status.get("proxy_retries", 0)
     state = "RUNNING" if status["running"] else "DONE"
     speed = status.get("speed", 0.0)
 
@@ -381,7 +418,8 @@ async def _format_progress_message() -> str:
         f"Unique sites: {status['unique_count']}\n"
         f"Failed queries: {status['failed']}\n\n"
         f"Workers: {status['workers']}\n"
-        f"Proxy: {proxy_status} ({proxy_count} loaded)\n\n"
+        f"Proxy: {proxy_status} ({proxy_count} loaded)\n"
+        f"Proxy retries: {proxy_retries}\n\n"
         f"🕐 Last update: {now_str()} PHT"
     )
 
@@ -480,7 +518,9 @@ def main():
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
 
-    application.add_handler(CommandHandler("adddork", adddork_cmd))
+    # Use "adddorks" (plural) as primary, keep "adddork" as an alias
+    application.add_handler(CommandHandler("adddorks", adddorks_cmd))
+    application.add_handler(CommandHandler("adddork", adddorks_cmd))
     application.add_handler(CommandHandler("listdorks", listdorks_cmd))
     application.add_handler(CommandHandler("cleardorks", cleardorks_cmd))
 
@@ -491,6 +531,7 @@ def main():
     application.add_handler(CommandHandler("export", export_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
 
+    # Upload without reply → dorks by default
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_document))
 
     application.add_error_handler(error_handler)
