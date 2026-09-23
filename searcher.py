@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import socket
@@ -115,6 +116,9 @@ class SearchManager:
         self.load_proxies_from_file()
         self.load_sites_from_file()
 
+    # -------------------------------
+    # Runtime helpers
+    # -------------------------------
     def get_runtime(self) -> float:
         return time.time() - self.start_time if self.running and self.start_time else self.elapsed_time
 
@@ -135,6 +139,9 @@ class SearchManager:
         runtime = self.get_runtime()
         return self.processed / runtime if runtime > 0 else 0.0
 
+    # -------------------------------
+    # Remote fetch (streaming, no big buffer)
+    # -------------------------------
     def fetch_dorks_from_url(self, url: str, timeout: int = FETCH_READ_TIMEOUT,
                              total_timeout: int = FETCH_TOTAL_TIMEOUT, retries: int = 1) -> List[str]:
         return self.fetch_dorks_from_url_with_hooks(
@@ -146,13 +153,13 @@ class SearchManager:
                                         timeout: int = FETCH_READ_TIMEOUT,
                                         total_timeout: int = FETCH_TOTAL_TIMEOUT,
                                         retries: int = 1) -> List[str]:
-        """Read a raw text URL with one hard 60-second wall-clock limit.
-
-        The socket timeout is deliberately short so a blocked read cannot keep
-        the worker stuck after the wall-clock deadline has expired.
+        """
+        Stream-read a raw text URL with a hard 60s wall-clock cap.
+        Decodes chunks incrementally so we never buffer the full body in RAM.
         """
         if not url:
             return []
+
         deadline = time.monotonic() + total_timeout
         last_error = None
 
@@ -162,8 +169,10 @@ class SearchManager:
                 break
             if on_attempt:
                 on_attempt(attempt, retries)
-            chunks: List[bytes] = []
+
+            lines: List[str] = []
             partial = False
+
             try:
                 request_timeout = max(0.1, min(float(timeout), remaining))
                 req = urllib.request.Request(
@@ -178,19 +187,21 @@ class SearchManager:
                     if on_response:
                         on_response()
 
-                    # urllib's buffered reader may otherwise retain a long socket
-                    # timeout. Force every body read to observe the deadline.
                     try:
                         sock = resp.fp.raw._sock
                         sock.settimeout(max(0.1, min(float(timeout), deadline - time.monotonic())))
                     except Exception:
                         pass
 
+                    leftover = b""
+                    first_chunk_check = True
+
                     while True:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             partial = True
                             break
+
                         try:
                             chunk = resp.read(min(65536, max(1, int(remaining * 65536))))
                         except (socket.timeout, TimeoutError) as exc:
@@ -201,26 +212,48 @@ class SearchManager:
                             last_error = exc
                             partial = True
                             break
+
                         if not chunk:
                             break
-                        chunks.append(chunk)
+
+                        # HTML guard on first chunk
+                        if first_chunk_check:
+                            head = chunk[:200].lower()
+                            if b"<html" in head or b"<!doctype" in head:
+                                logger.error(f"URL returned HTML, not plain text: {url}")
+                                return []
+                            first_chunk_check = False
+
+                        # Decode incrementally — never keep raw bytes
+                        data = leftover + chunk
+                        *complete, leftover = data.split(b"\n")
+                        for raw_line in complete:
+                            s = raw_line.decode("utf-8", errors="ignore").strip()
+                            if s and not s.startswith("#"):
+                                lines.append(s)
+
+                    # Trailing line
+                    if leftover:
+                        s = leftover.decode("utf-8", errors="ignore").strip()
+                        if s and not s.startswith("#"):
+                            lines.append(s)
 
                 if partial and on_partial:
                     on_partial()
-                raw = b"".join(chunks).decode("utf-8", errors="ignore")
-                if not raw:
+
+                if not lines:
                     last_error = last_error or "empty response"
                     continue
-                head = raw[:200].lower()
-                if "<html" in head or "<!doctype" in head:
-                    logger.error(f"URL returned HTML, not plain text: {url}")
-                    return []
-                lines = [line.strip() for line in raw.splitlines()
-                         if line.strip() and not line.strip().startswith("#")]
+
                 if on_lines:
                     on_lines(len(lines))
-                logger.info("Fetched %s lines from %s%s", len(lines), url, " (PARTIAL)" if partial else "")
+
+                logger.info(
+                    "Fetched %s lines from %s%s",
+                    len(lines), url, " (PARTIAL)" if partial else ""
+                )
                 return lines
+
             except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout, TimeoutError) as exc:
                 last_error = exc
                 logger.warning("Fetch attempt %s/%s failed: %s", attempt, retries, exc)
@@ -245,13 +278,28 @@ class SearchManager:
         self.save_dorks_to_file()
         return self.total - before
 
+    # -------------------------------
+    # Sites — capped to prevent OOM
+    # -------------------------------
     def load_sites_from_file(self, filename=None):
         try:
             with open(filename or config.SITES_FILE, encoding="utf-8") as file:
-                self.unique_sites = deduplicate_by_domain({line.strip() for line in file if line.strip()})
+                lines = [line.strip() for line in file if line.strip()]
+            cap = getattr(config, "MAX_SITES_IN_MEMORY", 200_000)
+            if len(lines) > cap:
+                logger.warning(
+                    "sites.txt has %s lines — trimming to last %s",
+                    len(lines), cap
+                )
+                lines = lines[-cap:]
+            self.unique_sites = deduplicate_by_domain(set(lines))
+            logger.info("Loaded %s unique sites", len(self.unique_sites))
         except FileNotFoundError:
             self.unique_sites = set()
 
+    # -------------------------------
+    # Dorks
+    # -------------------------------
     def load_dorks_from_file(self, filename=None) -> int:
         try:
             with open(filename or config.DORKS_FILE, encoding="utf-8") as file:
@@ -284,6 +332,9 @@ class SearchManager:
         except Exception as exc:
             logger.error("Failed to save dorks: %s", exc)
 
+    # -------------------------------
+    # Proxies
+    # -------------------------------
     def load_proxies_from_file(self, filename=None) -> int:
         try:
             with open(filename or config.PROXIES_FILE, encoding="utf-8") as file:
@@ -329,6 +380,9 @@ class SearchManager:
         self.current_proxy_index += 1
         return proxy
 
+    # -------------------------------
+    # Search control
+    # -------------------------------
     async def start_search(self, max_results=config.MAX_RESULTS_PER_DORK,
                            workers=config.WORKERS, request_timeout=config.REQUEST_TIMEOUT) -> bool:
         if self.running:
@@ -345,6 +399,7 @@ class SearchManager:
         self.current_proxy_index = 0
         self.start_time = time.time()
         self.elapsed_time = 0
+        gc.collect()  # clean slate before heavy work
         self.search_task = asyncio.create_task(self._run_search(max_results, workers, request_timeout))
         return True
 
@@ -377,43 +432,96 @@ class SearchManager:
                 finally:
                     queue.task_done()
 
-        tasks = [asyncio.create_task(worker()) for _ in range(max(1, min(workers, len(self.dorks))))]
+        # Hard cap workers to prevent memory blowups
+        actual_workers = max(1, min(workers, len(self.dorks), 3))
+        tasks = [asyncio.create_task(worker()) for _ in range(actual_workers)]
+        logger.info(f"Search starting with {actual_workers} worker(s)")
+
         try:
             await queue.join()
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+
         self.running = False
         self.end_time = time.time()
         self.elapsed_time = self.end_time - self.start_time if self.start_time else 0
         self.unique_sites = deduplicate_by_domain(self.unique_sites)
         await self.write_sites_file()
+        gc.collect()
 
     async def _process_dork(self, dork, max_results, request_timeout):
+        """Try capped # of proxies per dork. Retry with next proxy on failure."""
         if self._stop_requested:
             return
         self.current_dork = dork
-        try:
+
+        # Cap retries to prevent spawning 1000+ threads
+        cap = getattr(config, "MAX_PROXY_ATTEMPTS_PER_DORK", 10)
+        max_attempts = min(len(self.proxies), cap) if self.proxies else 1
+
+        results = None
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            if self._stop_requested:
+                break
+
             proxy = self.get_next_proxy()
-            results = await asyncio.wait_for(
-                asyncio.to_thread(self._ddgs_search, dork, max_results, request_timeout, proxy),
-                timeout=request_timeout + 10,
-            )
+
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(self._ddgs_search, dork, max_results, request_timeout, proxy),
+                    timeout=request_timeout + 10,
+                )
+                if attempt > 1:
+                    self.proxy_retries += (attempt - 1)
+                break
+            except asyncio.TimeoutError:
+                last_error = "search timed out"
+                logger.warning(
+                    "Dork %r attempt %s/%s TIMED OUT after %ss",
+                    dork, attempt, max_attempts, request_timeout + 10
+                )
+                if attempt < max_attempts and not self._stop_requested:
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Dork %r attempt %s/%s failed via %s: %s",
+                    dork, attempt, max_attempts, proxy or "no-proxy", exc
+                )
+                if attempt < max_attempts and not self._stop_requested:
+                    await asyncio.sleep(0.5)
+
+        if results is None:
+            logger.error("Dork %r failed after %s attempt(s): %s", dork, max_attempts, last_error)
+            self.failed += 1
+            self.processed += 1
+            self.current_dork = None
+            self.last_update_time = time.time()
+            results = None
+            gc.collect()
+            return
+
+        try:
             for result in results:
                 if result.get("href"):
                     self.unique_sites.add(normalize_url(result["href"]))
             self.unique_sites = deduplicate_by_domain(self.unique_sites)
             await self.write_sites_file()
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
-            logger.error("Error searching %r: %s", dork, exc)
-            self.failed += 1
+            logger.error("Error merging results for %r: %s", dork, exc)
         finally:
             self.processed += 1
             self.current_dork = None
             self.last_update_time = time.time()
+            # Free the results list ASAP
+            results = None
+            gc.collect()
 
     def _ddgs_search(self, query, max_results, request_timeout, proxy=None) -> List[Dict]:
         if proxy:
@@ -425,6 +533,9 @@ class SearchManager:
         with DDGS(timeout=request_timeout) as ddgs:
             return list(ddgs.text(query, max_results=max_results))
 
+    # -------------------------------
+    # Export & status
+    # -------------------------------
     async def export_sites(self) -> List[str]:
         async with self.lock:
             return sorted(self.unique_sites)
