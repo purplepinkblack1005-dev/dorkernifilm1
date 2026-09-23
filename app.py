@@ -356,7 +356,7 @@ async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "do
         )
     else:
         total = len(manager.proxies) if mode == "proxies" else len(manager.dorks)
-        partial_note = "\n⚠️ _Partial read — connection stalled, kept what we got_" if state.get("partial") else ""
+        partial_note = "\n⚠️ _Partial read — stopped at 120s cap, kept what we got_" if state.get("partial") else ""
         final = (
             f"✅ **Merged {state['added']} new {mode}!**\n\n"
             f"🔗 `{url}`\n"
@@ -378,7 +378,7 @@ def _build_fetch_status_message(url: str, mode: str, elapsed: int, state: dict) 
         if elapsed > 20:
             status_line += "\n💤 Source may be cold-starting (Render)"
     elif phase == "reading":
-        status_line = "📖 Server responded — reading content..."
+        status_line = "📖 Server responded — reading content...\n⏳ Will stop at 120s cap"
     elif phase == "saving":
         status_line = f"💾 Got {state['lines']} lines — saving to file..."
     else:
