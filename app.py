@@ -59,22 +59,29 @@ def start_health_server():
 
 
 # -------------------------------
-# Helper: extract lines from a replied .txt document
+# Helper: safe edit with fallback
+# -------------------------------
+async def _safe_edit(msg, text: str, parse_mode: str = "Markdown"):
+    """Edit a Telegram message; swallow errors so the flow never breaks."""
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode)
+        return True
+    except Exception as e:
+        logger.debug(f"edit_text failed: {e}")
+        return False
+
+
+# -------------------------------
+# Helper: extract lines from a replied .txt
 # -------------------------------
 async def _read_document_from_reply(update: Update):
-    """
-    If the message is a reply to a message that has a .txt document attached,
-    download and return (filename, lines). Otherwise return (None, None).
-    """
     reply = update.message.reply_to_message
     if not reply or not reply.document:
         return None, None
-
     doc: Document = reply.document
     filename = (doc.file_name or "").lower()
     if not filename.endswith(".txt"):
         return None, None
-
     file = await doc.get_file()
     data = await file.download_as_bytearray()
     text = data.decode("utf-8", errors="ignore")
@@ -169,7 +176,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /adddorks — literal dork, URL, OR reply-to-file
+# /adddorks — literal, URL, or reply-to-file
 # -------------------------------
 @owner_only
 async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,27 +210,12 @@ async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please provide a dork or URL.")
         return
 
-    # URL mode
+    # Case 3 — URL mode (with live editing)
     if arg.startswith("http://") or arg.startswith("https://"):
-        msg = await update.message.reply_text(
-            f"📥 Fetching dorks from:\n`{arg}`\n\nThis may take up to 60s (cold start)...",
-            parse_mode="Markdown"
-        )
-        added = await asyncio.to_thread(manager.load_dorks_from_remote, arg)
-        if added == 0:
-            await msg.edit_text(
-                "❌ Failed to fetch dorks from that URL.\n"
-                "Check the URL in your browser — it must return raw dork lines."
-            )
-            return
-        await msg.edit_text(
-            f"✅ Fetched & merged **{added}** new dorks.\n"
-            f"Total dorks: **{len(manager.dorks)}**",
-            parse_mode="Markdown"
-        )
+        await _fetch_url_with_live_updates(update, arg, mode="dorks")
         return
 
-    # Literal dork
+    # Case 4 — literal dork
     count = manager.add_dorks([arg])
     await update.message.reply_text(
         f"✅ Added dork: `{arg}`\n"
@@ -233,7 +225,152 @@ async def adddorks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# /addproxy — literal proxy OR reply-to-file
+# Live-editing URL fetcher (shared by dorks & proxies)
+# -------------------------------
+async def _fetch_url_with_live_updates(update: Update, url: str, mode: str = "dorks"):
+    """
+    Fetch dorks/proxies from url, editing the SAME Telegram message
+    to show step-by-step progress. mode = "dorks" or "proxies".
+    """
+    start_ts = time.time()
+
+    def elapsed() -> int:
+        return int(time.time() - start_ts)
+
+    # Initial message
+    msg = await update.message.reply_text(
+        f"📥 **Fetching {mode}...**\n\n"
+        f"🔗 `{url}`\n\n"
+        f"⏱️ Elapsed: 0s\n"
+        f"🌐 Connecting to server...",
+        parse_mode="Markdown"
+    )
+
+    state = {
+        "phase": "connecting",
+        "attempt": 1,
+        "max_attempts": 5,
+        "lines": 0,
+        "done": False,
+        "added": 0,
+        "error": None,
+    }
+
+    # The actual fetch — runs in a thread, but we hook its progress via state
+    def on_attempt(attempt: int, max_attempts: int):
+        state["attempt"] = attempt
+        state["max_attempts"] = max_attempts
+        state["phase"] = "connecting"
+
+    def on_response_received():
+        state["phase"] = "reading"
+
+    def on_lines_parsed(n: int):
+        state["lines"] = n
+        state["phase"] = "saving"
+
+    async def fetcher():
+        try:
+            # Use the manager's fetch with callback hooks
+            raw_lines = await asyncio.to_thread(
+                manager.fetch_dorks_from_url_with_hooks,
+                url, on_attempt, on_response_received, on_lines_parsed
+            )
+            if not raw_lines:
+                state["error"] = "no dorks"
+                return
+
+            # Merge into the manager
+            if mode == "proxies":
+                before = len(manager.proxies)
+                manager.add_proxies(raw_lines)
+                state["added"] = len(manager.proxies) - before
+            else:
+                before = len(manager.dorks)
+                manager.add_dorks(raw_lines)
+                state["added"] = len(manager.dorks) - before
+        except Exception as e:
+            state["error"] = str(e)
+            logger.error(f"Fetcher crashed: {e}")
+        finally:
+            state["done"] = True
+
+    fetch_task = asyncio.create_task(fetcher())
+
+    # Live message editor — updates at most every 3 seconds
+    last_edit = 0.0
+    while not fetch_task.done():
+        await asyncio.sleep(1)
+        now = time.time()
+        if now - last_edit < 3:
+            continue
+        last_edit = now
+
+        e = elapsed()
+        text = _build_fetch_status_message(url, mode, e, state)
+        await _safe_edit(msg, text)
+
+    # Make sure task completed
+    try:
+        await fetch_task
+    except Exception as e:
+        state["error"] = str(e)
+
+    e = elapsed()
+
+    # Final edit
+    if state["error"] and state["added"] == 0:
+        final = (
+            f"❌ **Failed to fetch {mode}**\n\n"
+            f"🔗 `{url}`\n\n"
+            f"⏱️ Elapsed: {e}s\n"
+            f"🔁 Tried {state['max_attempts']} attempts\n\n"
+            f"**Why?**\n"
+            f"• Cold start on the source (Render sleeping)\n"
+            f"• URL returned HTML instead of plain text\n"
+            f"• 404 / paste expired\n"
+            f"• Network timeout\n\n"
+            f"💡 Try again in 30s — 2nd attempt is usually fast."
+        )
+    else:
+        total = len(manager.proxies) if mode == "proxies" else len(manager.dorks)
+        final = (
+            f"✅ **Merged {state['added']} new {mode}!**\n\n"
+            f"🔗 `{url}`\n"
+            f"⏱️ Took {e}s  •  {state['lines']} lines read\n"
+            f"📄 Total {mode}: **{total}**"
+        )
+
+    await _safe_edit(msg, final)
+
+
+def _build_fetch_status_message(url: str, mode: str, elapsed: int, state: dict) -> str:
+    """Compose the live status text based on current fetch phase."""
+    phase = state["phase"]
+    attempt = state["attempt"]
+    max_attempts = state["max_attempts"]
+
+    if phase == "connecting":
+        status_line = f"🌐 Connecting... (attempt {attempt}/{max_attempts})"
+        if elapsed > 20:
+            status_line += "\n💤 Source may be cold-starting (Render)"
+    elif phase == "reading":
+        status_line = "📖 Server responded — reading content..."
+    elif phase == "saving":
+        status_line = f"💾 Got {state['lines']} lines — saving to file..."
+    else:
+        status_line = "⏳ Working..."
+
+    return (
+        f"📥 **Fetching {mode}...**\n\n"
+        f"🔗 `{url}`\n\n"
+        f"⏱️ Elapsed: {elapsed}s\n"
+        f"{status_line}"
+    )
+
+
+# -------------------------------
+# /addproxy — literal or reply-to-file
 # -------------------------------
 @owner_only
 async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,9 +399,15 @@ async def addproxy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Single proxy
-    proxy_line = " ".join(context.args).strip()
-    count = manager.add_proxies([proxy_line])
+    arg = " ".join(context.args).strip()
+
+    # Case 3 — URL mode
+    if arg.startswith("http://") or arg.startswith("https://"):
+        await _fetch_url_with_live_updates(update, arg, mode="proxies")
+        return
+
+    # Case 4 — single proxy
+    count = manager.add_proxies([arg])
     await update.message.reply_text(f"✅ Added proxy.\nTotal proxies: {count}")
 
 
@@ -362,15 +505,10 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------
-# Auto file upload (no reply) → dorks by default
+# Auto file upload (no reply) → dorks
 # -------------------------------
 @owner_only
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Any .txt uploaded without a reply command → treated as DORKS.
-    To load PROXIES from a file, reply to it with /addproxy.
-    To load DORKS from a file explicitly, reply with /adddorks.
-    """
     doc: Document = update.message.document
     filename = (doc.file_name or "file.txt").lower()
 
@@ -518,7 +656,6 @@ def main():
     application.add_handler(CommandHandler("stop", stop_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
 
-    # Use "adddorks" (plural) as primary, keep "adddork" as an alias
     application.add_handler(CommandHandler("adddorks", adddorks_cmd))
     application.add_handler(CommandHandler("adddork", adddorks_cmd))
     application.add_handler(CommandHandler("listdorks", listdorks_cmd))
@@ -531,7 +668,6 @@ def main():
     application.add_handler(CommandHandler("export", export_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
 
-    # Upload without reply → dorks by default
     application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_document))
 
     application.add_error_handler(error_handler)
@@ -541,8 +677,4 @@ def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO
-    )
-    main()
+    logging.main()
